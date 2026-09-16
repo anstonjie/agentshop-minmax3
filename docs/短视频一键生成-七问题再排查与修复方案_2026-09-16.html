@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>短视频一键生成 · 七问题再排查与修复方案 v2（2026-09-16）</title>
+<style>
+  :root{
+    --ink:#1c1b22; --sub:#5d5a66; --line:#e4e1ea; --bg:#faf9fc; --card:#fff;
+    --red:#c62f2f; --redbg:#fdf1f1; --orange:#b4600a; --orangebg:#fdf6ec;
+    --green:#1d7a4f; --greenbg:#eef8f2; --blue:#2456a6; --bluebg:#eef3fb;
+    --purple:#6b46c1; --purplebg:#f4f0fc;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.75 -apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;}
+  .wrap{max-width:1080px;margin:0 auto;padding:36px 28px 80px}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:44px 0 12px;padding-left:10px;border-left:4px solid var(--ink)}
+  h3{font-size:16px;margin:22px 0 8px}
+  p{margin:8px 0}
+  .meta{color:var(--sub);font-size:13px;margin-bottom:20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0}
+  table{border-collapse:collapse;width:100%;margin:10px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:#f3f1f7;font-weight:600}
+  code{background:#f0eef5;border:1px solid #e2dfee;border-radius:4px;padding:1px 5px;
+    font-family:Consolas,"JetBrains Mono",monospace;font-size:12.5px;color:#43307a}
+  .sym{background:var(--redbg);border-left:4px solid var(--red);padding:8px 12px;border-radius:0 8px 8px 0;margin:8px 0}
+  .root{background:var(--orangebg);border-left:4px solid var(--orange);padding:8px 12px;border-radius:0 8px 8px 0;margin:8px 0}
+  .fix{background:var(--bluebg);border-left:4px solid var(--blue);padding:8px 12px;border-radius:0 8px 8px 0;margin:8px 0}
+  .acc{background:var(--greenbg);border-left:4px solid var(--green);padding:8px 12px;border-radius:0 8px 8px 0;margin:8px 0}
+  .note{background:var(--purplebg);border:1px dashed var(--purple);border-radius:8px;padding:10px 14px;font-size:13.5px}
+  .p{display:inline-block;border-radius:5px;padding:1px 8px;font-size:12px;font-weight:700;color:#fff;margin-right:6px}
+  .p0{background:var(--red)} .p1{background:var(--orange)} .p15{background:var(--blue)} .p2{background:var(--purple)}
+  .ok{color:var(--green);font-weight:700} .bad{color:var(--red);font-weight:700} .half{color:var(--orange);font-weight:700}
+  .k{font-weight:700}
+  ul{margin:6px 0;padding-left:22px}
+  li{margin:3px 0}
+  .small{font-size:12.5px;color:var(--sub)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>短视频一键生成 · 七问题再排查与修复方案 v2</h1>
+<div class="meta">2026-09-16 · 只读排查产物（未改代码）· 继承并修订《短视频一键生成-忠于原著与连贯性优化方案_2026-09-16》（v1，8/8 已落地）· 证据含 DB 实测（drama77《逆袭闯社会》）</div>
+
+<div class="note"><b>一句话总结论：</b>v1 把"忠于原著"的<b>文本层</b>修通了（beats 自动回填、大纲接正文），但<b>画面层</b>三件事没通电——① 上游视频队列 503 把每集 90% 的镜头打死、合成阶段静默丢段，成片只剩 10~35 秒（问题 1/7 的直接放大器）；② v1 的连贯性三件套（尾帧接力/转场/退化重试）<b>flag 默认关</b>，线上等于没开；③ 字幕烧录参数是 16:9 时代的硬编码，撞上了 9:16 竖屏成片。加上前端两个真 bug（分类 chip 不刷新、每集过程不展示），就是用户看到的全部七个症状。</div>
+
+<h2>〇、实证快照：drama77《逆袭闯社会》DB 实测</h2>
+<div class="card">
+<table>
+<tr><th>集</th><th>计划镜数 shotCount</th><th>step5 composed</th><th>step5 missing</th><th>成片 durationSec</th><th>step4 镜头状态</th></tr>
+<tr><td>1</td><td>11</td><td class="bad">1</td><td>10</td><td class="bad">10s</td><td>1 completed + 10 failed</td></tr>
+<tr><td>2</td><td>10</td><td class="bad">1</td><td>9</td><td class="bad">10s</td><td>1 completed + 9 failed</td></tr>
+<tr><td>3</td><td>12</td><td>2</td><td>10</td><td class="bad">22s</td><td>—</td></tr>
+<tr><td>4</td><td>11</td><td class="bad">1</td><td>10</td><td class="bad">10s</td><td>—</td></tr>
+<tr><td>5</td><td>11</td><td>3</td><td>8</td><td class="bad">35s</td><td>—</td></tr>
+<tr><td>6</td><td>10</td><td>2</td><td>8</td><td class="bad">20s</td><td>—</td></tr>
+<tr><td>7</td><td>12</td><td>2</td><td>10</td><td class="bad">20s</td><td>—</td></tr>
+</table>
+<p class="small">目标集装箱时长 ep_target_sec=120s（episode-boundary.ts:55）。失败镜头 error 抽样（ep1 shot#2、ep2 shot#1，逐字）：<br>
+<code>Agnes video create HTTP 503: {"code":"video_queue_full","message":"视频队列已满，请稍后重试"}</code><br>
+即：<b>不是算错时长，是上游视频队列满 → 90% 镜头 failed → 合成只拼存活段 → "每集 10 秒"。</b>同剧资产实测：character 4 / location 4 / prop 3 / vehicle 0 / wardrobe 0（confirmed），分类数据存在。</p>
+</div>
+
+<h2>一、问题 1：每集视频只有 10 秒</h2>
+<div class="sym"><b>症状：</b>7 集里 3 集 10 秒、其余 20~35 秒，与"每集 120 秒"的目标完全不符。</div>
+<div class="root"><b>根因链（三段叠加）：</b>
+<ul>
+<li><span class="k">上游 503 无重试：</span>step4 i2v 遇 <code>video_queue_full</code> 直接记 failed（open-montage.service.ts:889-891），无退避重掷；11 镜并发打满上游队列，实测死亡率 90%。</li>
+<li><span class="k">合成静默丢段：</span><code>if(!sv.video_url) continue</code>（open-montage.service.ts:1008），下载失败仅 warn（:1018），<b>0 段才报错</b>（:1023）；missing_shots 只上报不拦截（:1163-1164）——代码注释自证"成片短一截而用户完全不知道"。</li>
+<li><span class="k">单段兜底 10s：</span>i2v 时长 clamp(4,12)、缺省兜底 <b>10</b>（open-montage.service.ts:835，二次 clamp :1427）——存活 1 段时成片天然 ≈10s，与 DB 完全吻合。</li>
+</ul>
+排除项：集装箱目标（episode-boundary.ts:55,69 → novel-ledger.service.ts:451-453 → orchestrator:301,461）链路完好，产不出 10s 集；手动 onlyShot 补做路径无批次侧补做闸（orchestrator:404-408 只护批次路径）是次要入口。</div>
+<div class="fix"><b>修复：</b>① step4 对 503/queue_full 加退避重掷（≤3 次，间隔递增）+ 每集 i2v 并发限速（对齐上游"每 key 每分钟创建限额"）；② step5 加<b>成片门</b>：composed/planned &lt; 60% 或 durationSec &lt; 45s 判不达标 → 不置 done，自动把 failed 镜写回 DramaBatch cursor 补做后重合成（复用现有断点续跑）；③ 补做仍不达标才 done，但 missing_shots 必须在剧集卡红字露出 + 一键补镜重合成入口（与问题 6 合并做）。</div>
+<div class="acc"><b>验收：</b>重跑 1 集：durationSec ≥ 目标 60%、missing_shots=0 或有在跑补做任务；用 503 夹具（mock 上游全 503）证明门会拦、不会交 10s 片。</div>
+
+<h2>二、问题 2：小说与视频没有对齐</h2>
+<div class="sym"><b>症状：</b>小说→剧本→分镜→字幕→拉片，链路名字都在，但成片"不像这部小说"。</div>
+<div class="root"><b>逐跳现状（v1 后复核）：</b>
+<table>
+<tr><th>跳</th><th>原文/逐字 quote 在不在</th><th>证据</th></tr>
+<tr><td>1 存储 → 2 beats 抽取 → 3 ledger 落库</td><td class="ok">在（已自动化）</td><td>novel-ledger.service.ts:230,362-421；beat-extract.ts:109-125（v1 P0-a 已落地）</td></tr>
+<tr><td>4 剧本 → 5 分集大纲</td><td class="ok">在</td><td>episode-outline-prompt.ts:30-33,64-70 接 chapterExcerpt+beatsAnchor（v1 P0-b 已落地，实测锚点 3327 字真实正文）</td></tr>
+<tr><td><b>6 分镜 shots</b></td><td class="bad">断流</td><td>大纲输出契约<b>无 quote 字段</b>（episode-outline-prompt.ts:122-140），beats 只活在提示词里没落 stepData → 分镜只拿 ≤50 字 scene.summary 重编（open-montage.service.ts:568-580；drama.service.ts:1371-1374）</td></tr>
+<tr><td>7 字幕</td><td class="bad">断流</td><td>字幕=shot.dialogue（LLM 自造）+ASR（open-montage.service.ts:1096-1107；timeline.ts:229-231），与原著台词无对照</td></tr>
+<tr><td>8 拉片/coverage 质检</td><td class="bad">假通过</td><td>check:coverage 仅手动端点（drama.controller.ts:575-589）；covered_by 全链路无回写（novel-ledger.service.ts:877 写死 pending）→ 真跑必全红但没人跑</td></tr>
+</table>
+另三处死代码/回退：arc.purpose 仍是章节标题 " / " 拼接（novel-pipeline.service.ts:117-129）；extractTaskUuid 要求 36 位 UUID 而 ledger key 是 64 位 sha256（novel-ledger.service.ts:107-110 vs :184）→ 小说圣经/logline 播种<b>永不执行</b>（:436-450）；重排后 episodes[].hook/cliffhanger 置空无回填（episode-boundary.ts:192-198）。</div>
+<div class="fix"><b>修复：</b>① 大纲输出契约加 <code>quotes[]</code>（每场必引 1~3 条 beats quote 原文）并落 stepData → 分镜 shot.description/dialogue 强制引用（确定性门：dialogue 与 quote 的字符重合度阈值，不过门回炉）；② coverage 自动化：step5 后回写 covered_by，红项进剧集卡；③ 修 arc.purpose、extractTaskUuid 死分支、重排 hook 回填三处小修。</div>
+<div class="acc"><b>验收：</b>抽 1 集人工对照：每镜台词/画面描述能指回原著 quote；coverage 自动报告红项清单可见；beats 表 status 不再恒 pending。</div>
+
+<h2>三、问题 3：字幕超屏 / 带说话人和表情</h2>
+<div class="sym"><b>症状：</b>字幕要么一行冲出屏幕，要么整行显示"人名：（表情）台词"。</div>
+<div class="root"><b>根因（四个硬编码 + 一个设计开关）：</b>
+<ul>
+<li>ASS 画布硬编码 <code>PlayResX 512 / PlayResY 288</code>（16:9）+ FontSize 12（timeline.ts:671/678），而成片默认 <b>9:16 竖屏</b>（open-montage.service.ts:350/762/1421）→ libass 按高度缩放，字被放大近一倍，18 字远超屏宽。</li>
+<li><code>wrapCueText</code> 固定 18 字/行，超限<b>无上限并入末行</b>（timeline.ts:541/563-567）→ 长台词末行爆宽。</li>
+<li>说话人前缀在折行<b>之后</b>追加、不占 18 字预算（timeline.ts:694/711；renderCueText:605-607）→ 首行 = 人名 + 18 字。</li>
+<li>安全区缺失：MarginL/R 仅 16/512（timeline.ts:678）；SRT 路径 force_style 无 Margin（open-montage.service.ts:1252-1260）；<code>WrapStyle:2</code> 关掉 libass 自动折行（timeline.ts:669）。</li>
+<li>说话人名是<b>设计性回加</b>：showSpeakerName 默认 'auto'、≥2 说话人即加前缀（timeline.ts:596-600），两处烧录调用都没传 false（open-montage.service.ts:1124/1126）。</li>
+<li>表情括注：09-15 的 dialogue-sanitizer 已能剥中文括号+全角冒号（dialogue-sanitizer.ts:57/79-83，dist 已含）；若仍见 = 无括号格式（"张三愤怒地你…"）未覆盖，或线上跑的是 09-15 前 build。</li>
+</ul></div>
+<div class="fix"><b>修复：</b>① PlayRes/FontSize 按成片真实分辨率生成（竖屏 720×1280 档），maxChars 由像素宽推导；WrapStyle 改 0/1；② 取消"无限并入末行"，改增行或缩字；③ prefix+body 一起进折行预算；④ 烧录调用传 <code>showSpeakerName:false</code>（短剧字幕只要台词）；⑤ force_style 补 MarginL/R；⑥ sanitizer 补无括号"人名+表情副词"模式 + 击穿用例。</div>
+<div class="acc"><b>验收：</b>竖屏成片截帧：任意 cue 不超安全区；字幕行无人名、无括注；用 30 字长台词夹具证明不爆宽。</div>
+
+<h2>四、问题 4：资产太少 + 多条胳膊坏图无检测无重生成</h2>
+<div class="sym"><b>症状：</b>资产数量少；人物定妆图出现多条胳膊（用户图 1/图 2）直接入库，无自动检测、无重生成。</div>
+<div class="root"><b>根因：</b>
+<ul>
+<li><span class="k">数量是提示词硬编码：</span>"主要角色 2-5、道具 2-6、场景按 scenes"（open-montage.service.ts:443），与小说实际人物数无关；且只建 character/location/prop 三组（drama.service.ts:863-864），vehicle/wardrobe 从不生成。</li>
+<li><span class="k">零图像质检门：</span>generatePortrait 只判"图是否下载落地" <code>alive=!!local</code>（drama.service.ts:970）；"多余肢体"只存在于负向提示词（video-prompt.ts:63）——坏图照判 ok 入库。</li>
+<li><span class="k">重生成只兜硬失败且全手动：</span>端点齐（POST assets/:id/portrait{force} ctl:252、/portrait-batch ctl:320、/variants ctl:364），UI 入口也有（卡片"定妆" tab:477、抽屉"整套重画" tab:977），但<b>没有"坏内容→自动重生成"</b>，也没有任何检测触发点。</li>
+</ul></div>
+<div class="fix"><b>修复：</b>① 资产清单改由 ledger 实际抽取驱动（小说出现几个具名角色/场景/道具就建几个，上限放宽）；② 加<b>视觉质检门</b：定妆图落地后调平台内置视觉模型（走后端 /api/llm 网关，遵守"生成/检测一律走平台能力"铁律）检肢体数/人脸/手部崩坏，不合格自动重画 ≤2 次，仍坏则标 <code>quality_flag</code> 入库；③ 资产卡露出检测结果 + "坏图重生成"按钮（复用 portrait force 端点）；④ vehicle/wardrobe 要么按小说抽取生成、要么从 chip 隐藏（与问题 5 合并）。</div>
+<div class="acc"><b>验收：</b>用用户图 1/图 2 当夹具：质检门必须判不合格并触发重画；资产数 ≥ 小说具名角色数；坏图不再以 ok 状态入库。</div>
+
+<h2>五、问题 5：资产库"全部"有货、其他分类全空</h2>
+<div class="sym"><b>症状：</b>用户截图圈出 chip 行（全部/角色/场景/道具/载具/服装）：只有"全部"有内容。</div>
+<div class="root"><b>根因（已亲自复核源码 + DB）：</b>
+<ul>
+<li><span class="k">chip 切换既不重新请求、也不客户端过滤：</span>onTap 只 <code>setState(() =&gt; _kind = ...)</code>（drama_assets_tab.dart:435-439），GridView 原样渲染 <code>_assets</code>（:471-486）→ 分类视图显示什么完全取决于"上一次 _load 带的是哪个 kind"；任何带 kind 的刷新路径（搜索提交 :417、下拉刷新 :462、跑批结束刷新 :148）都会在你盯着某个 chip 时突然换列表——表现为分类内容错乱/空。</li>
+<li><span class="k">vehicle/wardrobe 恒空是真没数据：</span>创建路径只写三组（drama.service.ts:863-864）；DB 实测 drama77：character 4 / location 4 / prop 3 / vehicle 0 / wardrobe 0。</li>
+<li>排除项：三侧 kind 取值一致（前端 chip tab:43-49 = 后端 where svc:1936 = 创建校验 svc:53,349），<b>不是</b>值不匹配；数据也在，不是后端查不到。</li>
+</ul></div>
+<div class="fix"><b>修复：</b>① chip onTap 补 <code>_load()</code>（服务端过滤为准）+ 切换瞬间客户端先过滤防闪旧列表；② chip 加数量 badge（0 的类别灰显 + "本书未涉及"tooltip）；③ 与问题 4 ①合并：vehicle/wardrobe 按小说抽取生成，无则隐藏 chip。</div>
+<div class="acc"><b>验收：</b>连点六个 chip，每类立即显示对应子集（drama77 应见 4/4/3）；空类别显示"本书未涉及"而非误导性的"暂无资产"。</div>
+
+<h2>六、问题 6：每集生成过程黑盒，不可看不可改</h2>
+<div class="sym"><b>症状：</b>每集用了哪些剧情段、参考图、提示词、字幕，没有集中展示；用户无法修改/替换/定位错步。</div>
+<div class="root"><b>盘点结论：后端存得比前端展示的多得多。</b>
+<ul>
+<li><span class="ok">已落库：</span>stepData 每步 {input,output,generatedAt,elapsed_ms}（drama.service.ts:1266-1271）；step2 分镜含 descWarnings/rhythmWarnings（open-montage.service.ts:628-634）；step3 关键帧含 prompt/ref_urls/ref_sources/degraded/error（drama.service.ts:1413-1450）；step4 含 i2v prompt/seed/status/error（open-montage.service.ts:880-891）；step5 含 missing_shots/audit/timeline_url（:1188-1216）；DramaBatch.log 全时间线；DramaAsset.refs[].prompt；beats quote。</li>
+<li><span class="half">已展示：</span>episode_step_views.dart 六步视图齐；但<b>可编辑仅 step0 brief</b>（:127-142）；重试只有整步重生成/单镜关键帧/单镜视频三种粒度。</li>
+<li><span class="bad">生了没存：</span>本集所用 chapterExcerpt/beatsAnchor 进 prompt 即丢（drama.service.ts:1235-1238）；step0/step2 的 LLM prompt 原文丢（open-montage.service.ts:553-601）；字幕 cues 全文只落磁盘 timeline.json（:1114）。</li>
+<li><span class="bad">存了没展示：</span>关键帧 prompt/ref 图、step4 i2v prompt/seed、warnings、missing_shots/audit、字幕内容（只显文件路径 :966-970）、资产 prompt、beats quote、Batch.log（工作台只取 log.last）。</li>
+<li><span class="bad">展示了不可改：</span>后端 <code>PUT steps/:step/output</code> 已实现（drama.controller.ts:433-439）但前端<b>零调用</b>；<code>POST keyframe/preview</code>（ctl:266-274）零调用；字幕改后无重烧端点；缺镜无"补这几镜再合成"入口。</li>
+</ul></div>
+<div class="fix"><b>修复：</b>① 回填三样进 stepData：quote 锚点、prompt_used、字幕 cues；② episode_step_views 每步加"提示词/证据"折叠块（关键帧缩略图+ref 来源、i2v prompt/seed、warnings、missing_shots/audit、字幕预览）；③ 接上 PUT output：分镜台词/描述行内编辑→单镜重出；关键帧可换参考图重出；④ 新增字幕重烧端点 + 缺镜一键补合成；⑤ 工作台加 Batch.log 全时间线页（哪步错、错因、扣分一目了然）。</div>
+<div class="acc"><b>验收：</b>任选 1 集：能看到本集 quote 锚点/每镜 prompt/字幕全文；改一句台词不重跑整步即可重烧；missing_shots 有一键补做按钮。</div>
+
+<h2>七、问题 7（最严重）：集与集之间没钩子、断断续续</h2>
+<div class="sym"><b>症状：</b>完整小说做出来的视频集间断裂、无悬念承接。</div>
+<div class="root"><b>机制盘点：文本层已通，画面层全没通电。</b>
+<table>
+<tr><th>连贯性机制</th><th>状态</th><th>证据</th></tr>
+<tr><td>beats→大纲锚点 / 分集边界落钩子章尾 / hookOut→下集 hookIn（文本）</td><td class="ok">已实现</td><td>beat-extract.ts:29,109；novel-anchor.ts:91-124；episode-boundary.ts:113,151；drama.service.ts:1317-1320</td></tr>
+<tr><td>角色/场景资产跨集复用（防换脸）</td><td class="ok">已实现</td><td>keyframe-plan.ts:132-209；seed 锁定 drama.service.ts:1404</td></tr>
+<tr><td>集尾强制钩子<b>镜头</b></td><td class="bad">缺失</td><td>rhythm-guard 只查开篇 8s hook 且<b>只警告</b>（rhythm-guard.ts:93-100）；genStep4Shots 无末镜约束（open-montage.service.ts:553-567）</td></tr>
+<tr><td>上集尾帧→下集首帧 / 镜头间尾帧接力</td><td class="bad">默认关</td><td>relay 仅集内链且 flag off（relay-plan.ts:8-9；open-montage.service.ts:901-902，DRAMA_SHOT_RELAY）</td></tr>
+<tr><td>转场（叠化/match-cut 替代裸 concat）</td><td class="bad">默认关</td><td>transition-plan.ts:7；open-montage.service.ts:1052-1055（DRAMA_COMPOSE_TRANSITIONS）</td></tr>
+<tr><td>openHooks 悬念快照进 prompt</td><td class="half">半死</td><td>merge 支持但 step0/5 回写从不传 openHooks（drama.service.ts:1331-1333,1497-1501）→ prompt 恒空（episode-outline-prompt.ts:97）</td></tr>
+<tr><td>集首前情回顾</td><td class="bad">刻意禁</td><td>episode-outline-prompt.ts:79"不要旁白解释前情"——需重新拍板</td></tr>
+<tr><td>死镜/接缝硬跳质检</td><td class="half">只测不拦</td><td>video-audit.ts:357；open-montage.service.ts:1166-1185（verdict 仅 review，不回炉）</td></tr>
+</table>
+<b>放大器：</b>问题 1 让每集只活 1~3 镜——叙事节拍整段丢失，hookIn/hookOut 写得再好也没有镜头去演它。"断断续续"= 生存层（问题 1）+ 画面承接层（本表）双重叠加。</div>
+<div class="fix"><b>修复：</b>① 先修问题 1（镜活下来，钩子才有载体）；② relay 尾帧接力 + 转场 flag 默认开（配 i2v 限速，成本 ≈ 最长链长 × 63s/集，v1 已实测）；③ rhythm-guard 加"集尾钩子镜头"硬约束：末镜 rhythm 必须 ∈ {turn, cliffhanger, payoff}，不过门回炉重排（warn→block）；④ openHooks 回写接通；⑤ 集首 3 秒视觉回顾（上集尾帧淡入 + 一行回顾字幕）替代被禁的旁白回顾，需用户拍板；⑥ video-audit 死镜/硬跳从 review 升级为回炉触发（与问题 1 补做通道共用）。</div>
+<div class="acc"><b>验收：</b>相邻两集：下集首帧与上集尾帧同源（relay 链命中）；每集末镜 rhythm 命中钩子角色；video-audit 接缝跳变数前后对比下降；人工连看 3 集能复述"上集留了什么悬念、本集怎么接的"。</div>
+
+<h2>八、落地批次（建议顺序）</h2>
+<div class="card">
+<table>
+<tr><th>批次</th><th>内容</th><th>对应问题</th><th>量级</th></tr>
+<tr><td><span class="p p0">批 1 止血</span></td><td>i2v 503 退避重试+并发限速；step5 成片门+自动补做；字幕竖屏四参数+showSpeakerName:false；chip 补 _load+badge</td><td>1 / 3 / 5</td><td>≈1 天</td></tr>
+<tr><td><span class="p p1">批 2 连贯与原著</span></td><td>relay+转场默认开；集尾钩子镜头硬门；openHooks 接通；大纲契约加 quotes[]→分镜/字幕引用门；coverage 自动回写；arc.purpose/extractTaskUuid/重排 hook 三小修；集首回顾拍板</td><td>7 / 2</td><td>≈2-3 天</td></tr>
+<tr><td><span class="p p15">批 3 透明工作台</span></td><td>stepData 回填 quote/prompt_used/cues；六步"提示词/证据"折叠块；接 PUT output 行内编辑；字幕重烧端点；缺镜一键补合成；Batch.log 时间线页</td><td>6（+1 的露出）</td><td>≈2 天</td></tr>
+<tr><td><span class="p p2">批 4 资产质量</span></td><td>资产清单 ledger 驱动；视觉质检门+自动重画+坏图按钮；vehicle/wardrobe 生成或隐藏</td><td>4（+5 的根）</td><td>≈2 天</td></tr>
+</table>
+<p class="small">每批落地后：tsc EXIT=0 + drama/open-montage 全套件绿 + 真实 1 集端到端复跑 + 夹具击穿用例（503 全灭门拦 / 30 字字幕不爆宽 / 多胳膊图被判坏 / chip 连点六类）。改 backend 前按仓库铁律先备份 + 查并发 running 任务。</p>
+</div>
+
+<h2>九、与 v1 方案的关系（继承 / 修订）</h2>
+<div class="card">
+<ul>
+<li><span class="ok">继承：</span>v1 P0-a/P0-b（beats 回填、大纲接正文）确认已落地且有效（锚点 3327 字真实正文）；P1-c 拉片质检门已挂（video-audit）；P2-a 节拍重排已 live。</li>
+<li><span class="bad">修订 1：</span>v1 判断"破碎=每镜太长+静止首帧+裸拼"，本次实证补充<b>更直接的生存层根因</b>：上游 503 打死 90% 镜头、合成静默丢段——不修这个，v1 所有节奏/转场优化都没有载体。</li>
+<li><span class="bad">修订 2：</span>v1 的 P1-a/P1-b/P2-b 以 flag 默认关交付（"off=零行为变化"），线上至今未通电——批 2 的核心动作就是"开闸+限速"，不是写新代码。</li>
+<li><span class="bad">修订 3：</span>v1 未覆盖字幕竖屏适配、chip 刷新、资产质检、过程透明四块——本次新增（问题 3/5/4/6）。</li>
+</ul>
+</div>
+
+<h2>十、风险与前置</h2>
+<div class="card">
+<ul>
+<li><b>上游队列是硬约束：</b>重试+限速能降 503 但不能消除；批 1 的成片门保证"不达标不交片"，代价是单集耗时变长（补做轮次）。需向用户明示预期。</li>
+<li><b>relay 顺序化成本：</b>每 key 每分钟 1 次创建限额 → 尾帧接力链最长链长 × ≈63s/集（v1 实测），批 2 开闸前确认额度。</li>
+<li><b>质检门误杀：</b>视觉模型判肢体有误报率，自动重画设 ≤2 次上限 + 坏图仍入库但打标，人工可一键恢复（不静默丢资产）。</li>
+<li><b>集首回顾是产品决策：</b>v1 刻意禁旁白回顾有其理由（拖节奏），批 2 ⑤ 用"视觉回顾"折中，需拍板。</li>
+</ul>
+</div>
+
+<p class="small">排查方法：5 路只读子代理按问题簇并行诊断（时长+钩子 / 对齐链 / 字幕 / 资产+分类 / 透明度）+ 主线程亲自复核 chip 源码与 MySQL 实证（drama77 七集 step4/step5 逐镜状态、资产 kind 分布）。全部结论带 file:line，未改任何代码。</p>
+
+</div>
+</body>
+</html>

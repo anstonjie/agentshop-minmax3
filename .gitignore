@@ -1,0 +1,183 @@
+# ============================================================================
+# Horizon App 根 .gitignore
+# ============================================================================
+# 原项目约定(由 maintainer 维护,谨慎修改)
+# ----------------------------------------------------------------------------
+
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# .vscode/ 原项目注释掉(允许跟仓库走),不打开
+
+# Flutter / Dart / Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# 2026-07-18 本地 Android SDK(避开 Android Studio 完整安装,
+# 用 cmdline-tools 装到项目内,被 TRAE sandbox 限制只能写项目目录)
+.android-sdk/
+
+# ============================================================================
+# 安全 / 凭据(本节是项目级,绝不能 push)
+# ----------------------------------------------------------------------------
+
+# 本地环境(可能含密钥,绝对不入库)
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+
+# Claude Code 本地状态(可能含 API key / 密码 —— 绝不外发)
+#   - skills/commands/agents/ 是公开 OSS(addyosmani/agent-skills),可以入库
+#   - settings.json / settings.local.json 含本地权限 + 凭据,排除
+#   - sessions / file-history / telemetry / plans / projects / backups 是
+#     Claude Code 运行时状态,不入库
+.claude/settings.json
+.claude/settings.local.json
+.claude/.credentials*
+.claude/statsig/
+.claude/telemetry/
+.claude/file-history/
+.claude/session-env/
+.claude/ide/
+.claude/shell-snapshots/
+.claude/backups/
+.claude/plans/
+.claude/projects/
+.claude/sessions/
+
+# ============================================================================
+# 跨平台 / 编辑器 / 临时产物
+# ----------------------------------------------------------------------------
+
+# Windows
+[Tt]humbs.db
+ehthumbs.db
+Desktop.ini
+
+# OS X
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 编辑器 swap 文件
+*.swp
+*.swo
+*~
+.vscode/
+
+# 临时 / 备份
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# ============================================================================
+# 后端 (NestJS) — 编译产物 / 依赖 / 大型二进制
+# ----------------------------------------------------------------------------
+# 注:backend/.gitignore 已覆盖 node_modules / dist / .env / .redis-binary
+#     根 .gitignore 补几条
+backend/dist/
+backend/.redis-binary/
+backend/.cache/
+backend/node_modules/
+
+# 已生成的视频 / 大型产物(开发期不要入库,生产期按需 git-lfs)
+backend/uploads/artifacts/
+
+# ============================================================================
+# admin-web (Vue) — 后台独立项目
+# ----------------------------------------------------------------------------
+# admin-web/.gitignore 已覆盖 node_modules / dist / .env.local / .vite
+admin-web/node_modules/
+admin-web/dist/
+
+# ============================================================================
+# 临时诊断 / 一次性脚本(容易进仓库但没复用价值)
+# ----------------------------------------------------------------------------
+# 根目录:开发期留下来的临时文件 / 日志
+**/a1.txt
+**/analyze-*.txt
+**/analyze_*.txt
+**/analyze-*.log
+**/outline_resp.json
+**/task*_full.txt
+**/first-l3-id.txt
+**/_bid_agent.txt
+**/_conv58_*.txt
+**/_bid_failed_out.txt
+**/test-sentinel.cjs
+**/.env.bak
+backups/
+**/backups/
+
+# backend 临时文件
+backend/api-run.log
+backend/api-start.log
+backend/nest-debug.log
+backend/agent_runtime_architecture.md
+backend/_backup/
+backend/plan-2.json
+backend/test-*.cjs
+backend/test-*.mjs
+backend/test-*.js
+backend/check-*.cjs
+backend/check-*.mjs
+backend/check-*.js
+backend/poll_*.js
+backend/fix-*.js
+backend/fix_*.cjs
+backend/qsoft*.js
+backend/qsoft*.ps1
+backend/reset*.js
+backend/temp_*.js
+backend/temp_*.mjs
+backend/_*.txt
+backend/_*.cjs
+backend/_*.mjs
+backend/_.env.bak
+# 2026-09-16 本次入库时补充:大体积/临时目录不入库
+.android-sdk/
+backend/uploads/
+.bak-*/
+.trash/
+.dart_tool/
+.loomy-attachments/
+.workbuddy*/
+.freebuff/
