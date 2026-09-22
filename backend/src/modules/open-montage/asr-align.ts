@@ -320,6 +320,31 @@ export function probeFps(ffprobeBin: string, file: string): number | null {
  * PlayRes 512×288(16:9),而剧级成片默认 9:16 竖屏,libass 按高度缩放后
  * 字被放大近一倍、18 字远超屏宽(用户反馈"字幕超出屏幕"的根因)。
  */
+/**
+ * 探测文件是否**有音轨**。
+ *
+ * 2026-09-22:xfade 转场分支原本只映射视频,成片零音轨 —— 用户反馈"视频没声音"。
+ * 修法是给滤镜图补一路音频链,但那样做的前提是**每个片段都有音轨**:
+ * 只要缺一路,acrossfade/concat 就会让整集合成失败。所以合成前必须逐个探。
+ * 探测失败一律按"没有"处理(降级为不加音频链,至少还能出片)。
+ */
+export function probeHasAudio(ffprobeBin: string, file: string): boolean {
+  try {
+    const { spawnSync } = require('child_process');
+    const proc = spawnSync(ffprobeBin, [
+      '-v', 'error',
+      '-select_streams', 'a:0',
+      '-show_entries', 'stream=codec_type',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
+      file,
+    ], { encoding: 'utf8', windowsHide: true, timeout: 30_000 });
+    if (proc.status !== 0) return false;
+    return String(proc.stdout || '').trim().split(/\r?\n/).some((l) => l.trim() === 'audio');
+  } catch {
+    return false;
+  }
+}
+
 export function probeResolution(
   ffprobeBin: string, file: string,
 ): { width: number; height: number } | null {

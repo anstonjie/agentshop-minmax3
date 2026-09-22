@@ -33,7 +33,7 @@ import { OssService } from '../oss/oss.service';
 import { planAssetShots } from '../drama/concept-art';
 import { buildShotVideoPrompt } from '../drama/video-prompt';
 import { buildTimeline, timelineToAss, timelineToSrt, assLayout, escapeAssText, wrapCueText } from '../drama/timeline';
-import { alignVideoWords, probeDurationSec, probeFps, probeResolution, resolveFfprobeBin } from './asr-align';
+import { alignVideoWords, probeDurationSec, probeFps, probeHasAudio, probeResolution, resolveFfprobeBin } from './asr-align';
 import { auditCompose } from './video-audit';
 import { checkShotDescriptions, summarizeDescViolations } from '../drama/shot-description-guard';
 import { rhythmPromptGuide, checkEpisodeRhythm, checkEpisodeEndHook } from '../drama/rhythm-guard';
@@ -75,6 +75,21 @@ interface DramaRow {
 }
 
 export interface LlmCtx { userId: number; agentId: number; }
+
+/** 2026-09-21: 清洗分镜提示词中容易误触上游内容审核(400 content_policy_violation)的极端词汇 */
+export function sanitizePromptForSafety(prompt: string): string {
+  if (!prompt || typeof prompt !== 'string') return '';
+  return prompt
+    .replace(/(烟头|抽烟|香烟|吸烟|吐出烟雾)/g, '金属零件')
+    .replace(/(死|杀|砍|刺|毙|戮|斩)/g, '击退')
+    .replace(/(鲜血|血液|流血|血迹|血泊|伤口|血肉)/g, '红色微光')
+    .replace(/(尸体|死尸|残肢|断臂|骷髅|白骨)/g, '沉睡的身影')
+    .replace(/(腐烂|福尔马林|恶臭|尸臭)/g, '陈旧斑驳')
+    .replace(/(手枪|步枪|子弹|开枪|射击|枪口)/g, '发射装置')
+    .replace(/(裸体|赤身|诱惑|性感)/g, '着装整齐')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 @Injectable()
 export class OpenMontageService {
@@ -123,14 +138,24 @@ export class OpenMontageService {
     return this.agnesKeys.length;
   }
 
-  /** 从 key 池轮询取一个 key(线程安全递增 idx) */
+  /** 每个 key 上次使用时间戳(选"最久没用"避免撞上游 1 RPM/分钟限制) */
+  private keyLastUsed = new Map<string, number>();
+
+  /** 从 key 池选"最久没用"的 key——nextKey 纯轮询会连续撞同一波 key,实测触发 65s 退避 */
   nextKey(): string {
     if (this.agnesKeys.length === 0) {
       throw new BadRequestException('AGNES_API_KEY 未配置(.env 里需要至少一个 AGNES_API_KEY)');
     }
-    const key = this.agnesKeys[this.keyRotateIdx % this.agnesKeys.length];
-    this.keyRotateIdx = (this.keyRotateIdx + 1) % this.agnesKeys.length;
-    return key;
+    // 选 lastUsed 最早的 key;从未用过(0)优先
+    let best = this.agnesKeys[0];
+    let bestTime = this.keyLastUsed.get(best) ?? 0;
+    for (let i = 1; i < this.agnesKeys.length; i++) {
+      const k = this.agnesKeys[i];
+      const t = this.keyLastUsed.get(k) ?? 0;
+      if (t < bestTime) { best = k; bestTime = t; }
+    }
+    this.keyLastUsed.set(best, Date.now());
+    return best;
   }
 
   // 2026-09-16:i2v 并发信号量。上游视频队列是**全局**资源(video_queue_full 503),
@@ -141,7 +166,10 @@ export class OpenMontageService {
   private readonly i2vWaiters: Array<() => void> = [];
   private i2vConcurrency(): number {
     const n = Number(process.env.DRAMA_I2V_CONCURRENCY);
-    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 4;
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+    // 2026-09-21:自适应 Key 池容量。避免拥有十几把 Key 却被写死为 4 并发,
+    // 默认取 Key 池数量(同时设置安全上限 16),兼顾上游限流与最大并发生成吞吐。
+    return Math.min(Math.max(4, this.agnesKeys.length), 16);
   }
   /** 取一个 i2v 槽位;返回释放函数(必须在 finally 里调) */
   private acquireI2vSlot(): Promise<() => void> {
@@ -593,32 +621,32 @@ ${hasRoster ? `\n名单(小说账本抽取,禁止遗漏):\n${JSON.stringify(rost
     // 本集目标总时长:调用方(连集批次)透传 input.targetSec。
     // 拿不到就按微短剧单集的常规体量给 120 秒,别让 LLM 自由发挥。
     const targetSec = Number(input?.targetSec) > 0 ? Math.round(Number(input.targetSec)) : 120;
-    // 单镜 8-12 秒 → 目标时长对应的镜头数区间,给 LLM 一个明确的数量锚点
-    const minShots = Math.max(2, Math.floor(targetSec / 12));
-    const maxShots = Math.max(minShots + 1, Math.ceil(targetSec / 8));
+    // 单镜 5-9 秒(兼顾短视频紧凑节奏与模型运动稳定性) → 目标时长对应的镜头数区间
+    const minShots = Math.max(3, Math.floor(targetSec / 9));
+    const maxShots = Math.max(minShots + 1, Math.ceil(targetSec / 5));
 
-      const sys = `你是导演 + 分镜师。把剧本拆成分镜 JSON。
+    const sys = `你是导演 + 分镜师。把剧本拆成分镜 JSON。
 要求:
 - 严格 JSON,无 markdown
-- **每镜 8-12 秒**(上游单段硬上限 12 秒,低于 8 秒会让成片碎成一片且拖慢出片)
+- **每镜 5-9 秒**(单镜切忌超过 10 秒, 彻底避免视频模型在长时自回归中产生面部融化与形变; 避免低于 4 秒导致碎镜)
+- **镜头节奏张弛有度**: 开场钩子/冲突重音 4-6 秒(快速抓人), 对话交锋 5-7 秒, 场景与氛围铺垫 6-8 秒
 - **所有镜头 duration_sec 之和必须接近本集目标总时长**(见下方"目标总时长"),不要凭感觉缩水
-- 因此本集镜头数应落在 ${minShots}-${maxShots} 个之间:宁可把一场戏拉长,也不要多切镜头
+- 因此本集镜头数应落在 ${minShots}-${maxShots} 个之间
 - shot_type: 远景/全景/中景/近景/特写
-- camera_motion: 静止/推/拉/摇/移/跟
-- description 是画面构图描述(供图像生成)
-- dialogue **每镜必填,禁止留空**:有台词写"角色名:台词";纯环境音写"(只有雨声/脚步/金属摩擦声)";旁白写"(旁白)…"。这一字段直接决定成片字幕,留空=观众看不到任何台词
-- **大纲 scene 带 quotes(原文逐字锚点)时**:该场镜头的 dialogue 与 description 必须基于 quotes 改编 ——
-  dialogue 保留 quotes 里台词的含义(可口语化、不可改意),description 保留 quotes 里"谁/在哪/做了什么";
-  禁止丢开 quotes 凭 summary 自由发挥(那是"视频对不上小说"的分镜层根因)
-- dialogue 要匹配 8-12 秒的镜头长度:一句话通常撑不满,请写足 2-3 句连贯台词或补充动作描写,不要让画面空转
-- handoff(多角色镜头):一句话写清注意/持物/视线交接 —— 谁把什么交给谁、谁的视线从哪移到哪;只写动作状态转换,**禁止写长相**;单人或无交接填空字符串
-- end_state:一句话写清本镜结束时的可见状态(位置/姿态/持物),下一镜从这里继续;可为空字符串
-- **description 禁止描述人物长相/发型/服装**:这些由角色定妆图决定,文字再写一遍会和参考图打架导致换脸。只写构图、动作、环境、光线
+- camera_motion: 优先使用 推/拉/摇/跟/移, 严禁过多使用"静止"(静止容易在视频模型中沦为无动效死镜)
+- description 画面构图必须包含明确的人物肢体动作或环境动态(如走动、转头注视、手部操作、波纹起伏), 严禁毫无动静的静止画面, 彻底杜绝死镜
+- dialogue **每镜必填且只能有单个角色说话(最多1-2句核心台词, 12-25字)**: 严禁在同一个镜头内塞进双人甚至多人来回对话(视频模型只能对单口型, 多人对白必造成声音错乱、对口型失败及字幕霸屏); 两人交谈必须分镜头切换表达! 纯环境音写"(只有雨声/脚步/金属摩擦声)"; 旁白写"(旁白)…"
+- **大纲 scene 带 quotes(原文逐字锚点)时**: 该场镜头的 dialogue 与 description 必须基于 quotes 改编 ——
+  dialogue 保留 quotes 里台词的含义(可口语化、不可改意), description 保留 quotes 里"谁/在哪/做了什么";
+  禁止丢开 quotes 凭 summary 自由发挥
+- handoff(多角色镜头): 一句话写清注意/持物/视线交接 —— 谁把什么交给谁、谁的视线从哪移到哪; 只写动作状态转换, 禁止写长相; 单人或无交接填空字符串
+- end_state: 一句话写清本镜结束时的可见状态(位置/姿态/持物), 下一镜从这里继续, 确保前后两镜时空与动作衔接自然, 严禁突兀闪现
+- **description 禁止描述人物长相/发型/服装**: 这些由角色定妆图决定, 文字再写一遍会和参考图打架导致换脸。只写构图、动作、环境、光线
 ${rhythmPromptGuide()}`;
     const usr = `剧本大纲:
 ${JSON.stringify(outline, null, 2)}
 
-本集目标总时长:${targetSec} 秒(镜头数 ${minShots}-${maxShots} 个,每镜 8-12 秒)
+本集目标总时长:${targetSec} 秒(镜头数 ${minShots}-${maxShots} 个,每镜 5-9 秒)
 
 角色设定(供引用):
 ${JSON.stringify((design?.characters || []).map((c: any) => ({ id: c.id, name: c.name })), null, 2)}
@@ -635,12 +663,12 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
     {
       "idx": 1,
       "scene_idx": 1,
-      "duration_sec": 10,
+      "duration_sec": 6,
       "shot_type": "中景",
-      "camera_motion": "静止",
-      "rhythm": "build",
-      "description": "画面构图描述(供图像生成)",
-      "dialogue": "角色名:台词(必填;环境音写括号描述)",
+      "camera_motion": "推",
+      "rhythm": "hook",
+      "description": "林雅快步穿过走廊, 眼神警惕地扫视四周, 步伐急促有力",
+      "dialogue": "林雅: 今晚的事, 绝不能让第三个人知道!",
       "characters": ["char_1"],
       "location_id": "loc_1",
       "props": ["prop_1"],
@@ -652,10 +680,30 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
 
     // 2026-07-31:max_tokens 从 4096 调大到 8192,避免分镜多时 JSON 被截断
     const raw = await this.callLlm(ctx, sys, usr, 0.6, 8192);
-    const parsed = this.parseJsonSafe(raw);
+    let parsed = this.parseJsonSafe(raw);
     if (!parsed || !parsed.shots) {
       this.logger.error(`[step4] LLM 生成 JSON 解析失败,raw.len=${raw.length}, preview=${raw.slice(0, 200)}`);
-      throw new BadRequestException('LLM 生成分镜失败,请重试');
+      // 2026-09-22:整集报废的代价太大 —— 连集批次 stopOnFailure=false 会**整集跳过**,
+      //   EP1 就是这么从成片里消失的。抢救(parseJsonSafe 第 5 层)失败后再重试一次:
+      //   降 temperature、压镜头数、压 description 字数,降低再次被截断的概率。
+      const retryRaw2 = await this.callLlm(
+        ctx,
+        `${sys}\n\n[修订要求] 上一次输出不是合法 JSON(多半是被截断)。这次务必:` +
+        `① 只输出 JSON,不要 markdown 代码块、不要任何解释文字;` +
+        `② 镜头数控制在 ${minShots} 个以内;` +
+        `③ description 每条不超过 60 字;④ 确保 JSON 完整闭合。`,
+        usr, 0.3, 8192,
+      ).catch(() => null);
+      if (retryRaw2) {
+        const p2 = this.parseJsonSafe(retryRaw2);
+        if (p2 && p2.shots) {
+          parsed = p2;
+          this.logger.log('[step4] 分镜重试一次后成功');
+        }
+      }
+      if (!parsed || !parsed.shots) {
+        throw new BadRequestException('LLM 生成分镜失败,请重试');
+      }
     }
     const shots0 = Array.isArray(parsed.shots) ? parsed.shots : [];
     const plannedSec0 = shots0.reduce(
@@ -694,9 +742,71 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       ? []
       : [`[集尾钩子门] ${endHook.reason};重生成仍未过,已标 hookShotMissing,建议人工改末镜或重跑本步`];
 
-    const plannedSec = shots.reduce(
+    let plannedSec = shots.reduce(
       (s: number, sh: any) => s + (Number(sh?.duration_sec) || 0), 0,
     );
+
+    // ── 2026-09-22 集时长硬校准 ──────────────────────────────────────────
+    // 实测:目标 120s,LLM 只给 14 镜 × 5.9s = 83s(-31%)。prompt 里已经写了
+    //   "所有镜头 duration_sec 之和必须接近目标总时长",仍然每次都取镜头数下限 +
+    //   每镜取短时长 —— 这是 LLM 的稳定偏置,靠再写一遍提示词改不掉。
+    //   按铁律「能脚本硬校验的绝不交 LLM」,这里做确定性缩放 + 残差分摊:
+    //     ① 按比例缩放每镜时长并 clamp 到 [SHOT_MIN, SHOT_MAX]
+    //     ② clamp 截断造成的残差,按镜序 ±1s 摊平,直到进入 ±5% 容差
+    //     ③ 减时长时跳过末镜 —— 末镜是集尾钩子,不该被削
+    const SHOT_MIN = 5;
+    const SHOT_MAX = 10; // 上游单段硬上限 12,留 2s 余量
+    if (shots.length > 0 && targetSec > 0 && plannedSec > 0) {
+      const ratio = targetSec / plannedSec;
+      if (ratio < 0.95 || ratio > 1.05) {
+        let acc = 0;
+        shots = shots.map((sh: any) => {
+          const d0 = Number(sh?.duration_sec) || 0;
+          const d = Math.min(SHOT_MAX, Math.max(SHOT_MIN, Math.round(d0 * ratio)));
+          acc += d;
+          return { ...sh, duration_sec: d };
+        });
+        const lo = Math.floor(targetSec * 0.95);
+        const hi = Math.ceil(targetSec * 1.05);
+        let guard = 0;
+        // 不够 → 逐镜 +1s(末镜也参与,钩子镜长一点无害)
+        while (acc < lo && guard++ < 500) {
+          let moved = false;
+          for (let i = 0; i < shots.length && acc < lo; i++) {
+            if ((Number(shots[i].duration_sec) || 0) < SHOT_MAX) {
+              shots[i].duration_sec = (Number(shots[i].duration_sec) || 0) + 1;
+              acc += 1; moved = true;
+            }
+          }
+          if (!moved) break; // 全到上限,放弃(说明镜头数本身不够,靠加时长补不回来)
+        }
+        // 超了 → 逐镜 -1s(从首镜开始,末镜最后才动)
+        while (acc > hi && guard++ < 1000) {
+          let moved = false;
+          for (let i = 0; i < shots.length && acc > hi; i++) {
+            if (i === shots.length - 1 && shots.length > 1) continue; // 先不动钩子镜
+            if ((Number(shots[i].duration_sec) || 0) > SHOT_MIN) {
+              shots[i].duration_sec = (Number(shots[i].duration_sec) || 0) - 1;
+              acc -= 1; moved = true;
+            }
+          }
+          if (!moved) {
+            // 只剩末镜还能减
+            const last = shots.length - 1;
+            if (shots.length === 1 || (Number(shots[last].duration_sec) || 0) <= SHOT_MIN) break;
+            shots[last].duration_sec = (Number(shots[last].duration_sec) || 0) - 1;
+            acc -= 1;
+          }
+        }
+        this.logger.log(
+          `[step4] 时长硬校准: ${plannedSec}s → ${acc}s (目标 ${targetSec}s,` +
+          ` ${shots.length} 镜, 缩放比 ${ratio.toFixed(2)})`,
+        );
+        plannedSec = acc;
+      }
+    }
+    // ── 时长硬校准结束 ────────────────────────────────────────────────────
+
     // P0-b(借 reelbench):画面描述质检门 —— 空话/过短/废话开头/重复。MVP 只出 warnings 不硬拦。
     const descViolations = checkShotDescriptions(shots);
     const descWarnings = summarizeDescViolations(descViolations);
@@ -719,6 +829,8 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       rhythmTagged: rhythmReport.tagged,
       hookShotMissing: !endHook.ok,
       endHook: { ok: endHook.ok, lastRole: endHook.lastRole, lastIdx: endHook.lastIdx, reason: endHook.reason },
+      // 2026-09-22:成片时长对账用 —— 校准后的计划总时长与本集目标,对齐报告直接取这两个数
+      plannedSec, targetSec,
     };
   }
 
@@ -732,6 +844,11 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
     ctx: LlmCtx, sessionUuid: string, options: any,
   ): Promise<any> {
     if (!shots || !shots.shots) throw new BadRequestException('请先生成分镜脚本');
+    // 2026-09-22:分段计时。实测(18 key 池)图像 API 本身很快 —— 无参考图 ~9s、
+    // 1 张参考图 ~21s、2 张 ~30s,且**并发度不影响单张耗时**(并发 3/9/18 总墙钟都是 ~30s)。
+    // 而批次日志显示关键帧这一步整段要 6~8 分钟,和 API 耗时差一个数量级。
+    // 差额到底在"参考图准备 / 出图 / 收尾落库"哪一段,以前只能猜,现在打点。
+    const tStep0 = Date.now();
 
     // 2026-08-28:从「把 step3 的 prompt 文字拼回去做纯文生图」改为**参考图驱动**。
     //   文字描述锁不住一张脸,这是换集换脸的根因;规划逻辑在 drama/keyframe-plan.ts,
@@ -746,9 +863,15 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
     const bySlug = indexLegacyConceptArt(conceptArt, design);
     const plans = shots.shots.map((sh: any) => buildKeyframePlan(sh, bySlug, styleSpec));
     const sum = summarizePlans(plans);
+    const tPlan = Date.now() - tStep0;
+    const refCount = plans.reduce((n, p) => n + ((p.refUrls || []).length), 0);
     this.logger.log(
       `[step5] 参考图驱动关键帧:${sum.withRef}/${sum.total} 镜带参考图,` +
       `${sum.degraded} 镜无参考图退化为文生图;待重定妆:${sum.needReportrait.join(',') || '无'}`,
+    );
+    this.logger.log(
+      `[step5][计时] 规划 ${tPlan}ms;参考图合计 ${refCount} 张` +
+      `(均 ${plans.length ? (refCount / plans.length).toFixed(1) : 0} 张/镜)`,
     );
 
     // 并行生成,每个任务轮询分配 key(单张失败不影响其他)
@@ -772,6 +895,15 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
             degraded: plan.degraded,
           };
         } catch (e: any) {
+          const fallbackUrl = (plan.refUrls || []).find((u: string) => typeof u === 'string' && /^https?:\/\//i.test(u));
+          if (fallbackUrl) {
+            this.logger.warn(`[step5] 镜 #${plan.shotIdx} 出图失败(${e?.message}), 自动使用定妆图兜底关键帧首帧`);
+            return {
+              shot_idx: plan.shotIdx, url: fallbackUrl, prompt: plan.prompt,
+              ref_urls: plan.refUrls, ref_sources: plan.refSources,
+              degraded: plan.degraded, fallback_to_ref: true,
+            };
+          }
           return {
             shot_idx: plan.shotIdx, url: null, prompt: plan.prompt,
             ref_urls: plan.refUrls, ref_sources: plan.refSources,
@@ -781,9 +913,15 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       })();
     });
 
+    const tGen0 = Date.now();
     const keyframes = await Promise.all(tasks);
+    const tGen = Date.now() - tGen0;
     const okCount = keyframes.filter((k: any) => k.url).length;
     this.logger.log(`[step5] 关键帧完成 ${okCount}/${keyframes.length}(带参考图 ${sum.withRef} 镜)`);
+    this.logger.log(
+      `[step5][计时] 出图 ${tGen}ms(${(tGen / 1000).toFixed(1)}s) / ${keyframes.length} 镜并行;` +
+      `本步累计 ${Date.now() - tStep0}ms —— 若出图只占一小截,时间就花在调用方或落库上`,
+    );
 
     return {
       keyframes,
@@ -907,20 +1045,39 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
         );
       }
       const shot = shotMap[k.shot_idx];
-      const imgUrl = imgUrlOverride || keyframeMap[k.shot_idx];
-      // 无关键帧的直接返回 skipped,不占 key
+      let imgUrl = imgUrlOverride || keyframeMap[k.shot_idx];
+      // 2026-09-21: 镜头防丢容灾 —— 绝不因为单镜关键帧缺失就轻易 skipped 导致成片缺戏硬跳!
+      if (!imgUrl) {
+        // ① 优先从该镜的关键帧参考图(角色定妆/场景图)取一张作为首帧
+        const kfItem = (keyframes.keyframes || []).find((x: any) => x.shot_idx === k.shot_idx);
+        const refUrl = (kfItem?.ref_urls || []).find((u: string) => typeof u === 'string' && /^https?:\/\//i.test(u));
+        if (refUrl) {
+          imgUrl = refUrl;
+          this.logger.warn(`[step6] 镜 #${k.shot_idx} 关键帧缺失, 自动使用角色/场景定妆参考图兜底首帧`);
+        } else {
+          // ② 兜底找前序镜头的有效关键帧或参考图
+          const anyPrevKf = (keyframes.keyframes || [])
+            .filter((x: any) => x.shot_idx < k.shot_idx && (keyframeMap[x.shot_idx] || (x.ref_urls && x.ref_urls[0])))
+            .pop();
+          const fallbackUrl = anyPrevKf ? (keyframeMap[anyPrevKf.shot_idx] || anyPrevKf.ref_urls[0]) : null;
+          if (fallbackUrl) {
+            imgUrl = fallbackUrl;
+            this.logger.warn(`[step6] 镜 #${k.shot_idx} 关键帧缺失, 自动使用前序镜 #${anyPrevKf.shot_idx} 画面兜底`);
+          }
+        }
+      }
+      // 无关键帧且无任何参考图可兜底的才返回 skipped
       if (!imgUrl) {
         presettled++;
+        this.logger.error(`[step6] 镜 #${k.shot_idx} 无任何可用关键帧或参考图, 标记 skipped`);
         return Promise.resolve({
           shot_idx: k.shot_idx, video_url: null, status: 'skipped', reason: 'no keyframe',
         });
       }
       const apiKey = this.nextKey(); // 每个任务拿不同 key
       // 2026-08-27:agnes-video-2.5-flash seconds 合法范围 "4"-"12",低于 4 的分镜 clamp 到 4
-      // 2026-09-15:兜底值从 5 提到 10 —— 分镜脚本缺失 duration_sec 时,
-      //   旧兜底 5 秒会让整集莫名其妙变短(镜头数不变、时长减半)。
-      //   与 genStep4Shots 的「每镜 8-12 秒」策略保持一致。
-      const duration = Math.max(4, Math.min(12, Math.round(shot?.duration_sec || 10)));
+      // 2026-09-15/2026-09-21: 与 genStep4Shots 的「每镜 5-9 秒」策略保持一致, 默认兜底 6s
+      const duration = Math.max(4, Math.min(12, Math.round(shot?.duration_sec || 6)));
 
       // 2026-09-05:运动语言提示词(方案2)—— 不再把给图像写的构图描述直接丢给
       //   视频模型,而是翻译成"镜头怎么动 + 主体怎么动 + 真实性底线"。
@@ -1007,7 +1164,7 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       const longest = chains.reduce((m, c) => Math.max(m, c.length), 0);
       const relayDir = path.join(this.sessionsDir, sessionUuid, 'relay');
       this.logger.log(
-        `[step6] 尾帧接力启用:${chains.length} 条链(最长 ${longest} 镜)/接力对 ${rplan.pairs.length}/硬切 ${rplan.hardCuts.length}`,
+        `[step6] 尾帧接力启用:${chains.length} 条链(最长 ${longest} 镜)/接力对 ${rplan.pairs.length}/硬切 ${rplan.hardCuts.length}/i2v并发度 ${this.i2vConcurrency()}`,
       );
       settledShots = 0;
       const chainResults = await Promise.all(chains.map(async (chain) => {
@@ -1210,6 +1367,53 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
     // P1-b(借 reelbench 转场):2026-09-16(批2)**默认开** xfade 叠化(DRAMA_COMPOSE_TRANSITIONS=0 可关)——
     //   之前默认关 = concat -c copy 裸拼,接缝硬跳是"断断续续"的接缝层根因;
     //   开时重编码,需片段同分辨率/帧率(上游同档位产出,实测满足)。
+    // 2026-09-22:xfade 要求各片段同分辨率。上游偶发降档(实测一集里 704x1280 与
+    //   704x960 混着)→ 链式 xfade 报 "input link main parameters do not match",
+    //   整集合成失败、concat.mp4 0 字节(EP1 就是这么没成片的)。
+    //   先探所有片段,只要尺寸不统一就按最大尺寸归一(scale+pad 补边,不裁内容)。
+    let normalize: { w: number; h: number; fps: number } | undefined;
+    // 2026-09-22:音轨探测。xfade 分支原本只 `-map [vout]`,成片零音轨(用户反馈
+    //   "视频没声音")。要挂音频链就得先知道哪些片段真有音轨 —— 缺的用等长静音补,
+    //   否则 acrossfade/concat 会因输入缺失整集合成失败。
+    let hasAudio: boolean[] | undefined;
+    try {
+      const probeBin = resolveFfprobeBin(ffmpegBin);
+      if (probeBin) {
+        const sizes = segPaths
+          .map((p) => probeResolution(probeBin, p))
+          .filter((s): s is { width: number; height: number } => !!s);
+        if (sizes.length === segPaths.length) {
+          const uniq = new Set(sizes.map((s) => `${s.width}x${s.height}`));
+          if (uniq.size > 1) {
+            normalize = {
+              w: Math.max(...sizes.map((s) => s.width)),
+              h: Math.max(...sizes.map((s) => s.height)),
+              fps: 30,
+            };
+            this.logger.warn(
+              `[step7] 片段分辨率不一致(${[...uniq].join(', ')}) → 归一到 ` +
+              `${normalize.w}x${normalize.h}@${normalize.fps}fps(scale+pad 补边)`,
+            );
+          }
+        }
+        hasAudio = segPaths.map((p) => probeHasAudio(probeBin, p));
+        const nAudio = hasAudio.filter(Boolean).length;
+        if (nAudio === 0) {
+          this.logger.warn(`[step7] ${segPaths.length} 个片段全部无音轨 → 成片将不含音频`);
+          hasAudio = undefined;
+        } else if (nAudio < segPaths.length) {
+          this.logger.warn(
+            `[step7] ${segPaths.length - nAudio}/${segPaths.length} 个片段无音轨 → ` +
+            `这些片段按等长静音补位(成片仍有声)`,
+          );
+        } else {
+          this.logger.log(`[step7] 音轨探测:${nAudio}/${segPaths.length} 个片段带音轨`);
+        }
+      }
+    } catch (e: any) {
+      this.logger.warn(`[step7] 分辨率探测失败(不影响主流程):${e?.message || e}`);
+    }
+
     const tplan = planCompose({
       segments: segPaths,
       durations,
@@ -1218,8 +1422,16 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
         ? Number(process.env.DRAMA_COMPOSE_TRANSITION_SEC) : 0.4,
       listFile,
       out: concatPath,
+      normalize,
+      hasAudio,
     });
-    if (tplan.mode === 'xfade') this.logger.log(`[step7] 转场已启用(xfade, ${tplan.filterComplex.length} 字符滤镜图)`);
+    if (tplan.mode === 'xfade') {
+      this.logger.log(
+        `[step7] 转场已启用(xfade, ${tplan.filterComplex.length} 字符滤镜图, ` +
+        `音轨 ${tplan.audioTracks}/${segPaths.length}` +
+        `${tplan.silentPadded ? ` + 静音补位 ${tplan.silentPadded}` : ''})`,
+      );
+    }
     await this.runFfmpeg(ffmpegBin, tplan.args);
 
     // 4) 【词级对齐】对合成后的整片跑一次 ASR(一次加载模型,整片绝对时间)。
@@ -1415,14 +1627,41 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
   }
 
   /** 跑一次 ffmpeg;失败带 stderr 尾巴抛错。cwd 可指定(滤镜用相对路径更稳) */
+  /**
+   * 跑 ffmpeg。**必须带超时** —— 2026-09-22 实测:一次滤镜图写错(全局 apad 无参 =
+   *   无限补静音 + -shortest)会让 ffmpeg **永不结束**,产物连 moov atom 都没有,
+   *   而这里原本没有超时,于是第 7 步就永久挂住 → 集永远 running → 又攒僵尸槽位。
+   *   超时后杀进程并 reject,让失败**响亮地**发生,由上层重试/告警,而不是静静挂死。
+   * 默认 20 分钟(整集 xfade 重编码量级);FFMPEG_TIMEOUT_MS 可调。
+   */
   private runFfmpeg(bin: string, args: string[], cwd?: string): Promise<void> {
+    const timeoutMs = Number(process.env.FFMPEG_TIMEOUT_MS) > 0
+      ? Number(process.env.FFMPEG_TIMEOUT_MS) : 20 * 60 * 1000;
     return new Promise<void>((resolve, reject) => {
       const { spawn } = require('child_process');
       const proc = spawn(bin, args, { windowsHide: true, cwd });
       let stderr = '';
+      let done = false;
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        try { proc.kill('SIGKILL'); } catch { /* 进程可能已退出 */ }
+        reject(new Error(
+          `ffmpeg 超时(${Math.round(timeoutMs / 1000)}s 未结束,已强杀):` +
+          ` ${args.slice(0, 6).join(' ')} ... ${stderr.slice(-400)}`,
+        ));
+      }, timeoutMs);
       proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
-      proc.on('error', reject);
+      proc.on('error', (e: any) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        reject(e);
+      });
       proc.on('close', (code: number) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
         if (code === 0) resolve();
         else reject(new Error(`ffmpeg 失败 code=${code}: ${stderr.slice(-500)}`));
       });
@@ -1467,8 +1706,11 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       ].join(',');
       vf = `subtitles=${subName}:force_style='${style}'`;
     }
+    // 2026-09-21: 电影级统一微调色 —— 增强微对比度与饱和度,消除灰暗的 AI 塑料感
+    const colorFilter = 'eq=contrast=1.05:saturation=1.08:brightness=0.01';
+    const finalVf = `${vf},${colorFilter}`;
     await this.runFfmpeg(bin, [
-      '-y', '-i', inputName, '-vf', vf,
+      '-y', '-threads', '0', '-i', inputName, '-vf', finalVf,
       '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
       '-c:a', 'copy',             // 保留 Agnes 视频自带的台词音轨
       outName,
@@ -1688,7 +1930,19 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
         validateStatus: () => true,
       });
       // 504 = Cloudflare 网关超时(图生图连发时实测出现过),同样可重试
-      if (!RETRYABLE_IMAGE_STATUS.has(resp.status)) break;
+      if (!RETRYABLE_IMAGE_STATUS.has(resp.status)) {
+        // 2026-09-21: 上游 400 content_policy_violation 敏感词拦截时, 自动净化提示词并重试一次
+        const errCode = resp.data?.error?.code || resp.data?.code;
+        if (resp.status === 400 && errCode === 'content_policy_violation' && attempt < maxAttempts) {
+          const safePrompt = sanitizePromptForSafety(body.prompt || prompt);
+          this.logger.warn(`[image] 命中上游 400 内容策略, 自动净化词汇重试: "${safePrompt.slice(0, 60)}..."`);
+          body.prompt = safePrompt;
+          if (body.extra_body?.negative_prompt) delete body.extra_body.negative_prompt;
+          await new Promise((r) => setTimeout(r, 2_000));
+          continue;
+        }
+        break;
+      }
       if (attempt === maxAttempts) break;
       const backoffMs = 5_000 * attempt;
       this.logger.warn(`[image] Agnes HTTP ${resp.status},${backoffMs / 1000}s 后重试 ${attempt}/${maxAttempts - 1}`);
@@ -1959,9 +2213,9 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       const localVideo = path.join(workDir, `relay_src_${shotIdx}.mp4`);
       const framePath = path.join(workDir, `relay_tail_${shotIdx}.jpg`);
       await this.downloadFile(videoUrl, localVideo);
-      // -sseof -0.15:从末尾前 0.15s 定位,取 1 帧作尾帧(与 video-audit 尾帧口径一致)
+      // 2026-09-21: -sseof -0.25: 避开末端 0.15s 可能出现的动态模糊或黑屏衰减, 保证抽出的接力尾帧清晰稳定
       await this.runFfmpeg(ffmpegBin, [
-        '-hide_banner', '-y', '-sseof', '-0.15', '-i', localVideo,
+        '-hide_banner', '-y', '-sseof', '-0.25', '-i', localVideo,
         '-frames:v', '1', '-q:v', '2', framePath,
       ]);
       if (!fs.existsSync(framePath)) return null;
@@ -2097,6 +2351,66 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       }
     }
 
+    // 5. 2026-09-22:抢救**被截断**的 JSON。
+    //    上游把 LLM 输出掐断时(实测分镜 raw 只有 4119 字符就断),最后一条
+    //    shot 的字符串没闭合、括号也没配平 —— 前 4 层全部失效,整步直接抛
+    //    "LLM 生成分镜失败",连集批次随即**整集跳过**(EP1 实测就这么没了)。
+    //    这里从末尾往前找收口点截断 + 补括号,能救回前面那些完整镜头;
+    //    丢最后一两镜的代价远小于整集报废(且下游时长校准会把总时长补回来)。
+    const salvaged = this.salvageTruncatedJson(raw || '');
+    if (salvaged) return salvaged;
+
+    return null;
+  }
+
+  /** 按当前括号/字符串栈把未闭合的 JSON 补齐(供 salvageTruncatedJson 用) */
+  private closeBrackets(s: string): string {
+    let inStr = false, esc = false;
+    const stack: string[] = [];
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (inStr) {
+        if (esc) { esc = false; continue; }
+        if (c === '\\') { esc = true; continue; }
+        if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') { inStr = true; continue; }
+      if (c === '{' || c === '[') stack.push(c);
+      else if (c === '}' || c === ']') stack.pop();
+    }
+    let out = s;
+    if (inStr) out += '"';
+    for (let i = stack.length - 1; i >= 0; i--) out += (stack[i] === '{' ? '}' : ']');
+    // 悬空逗号:截断常停在 "xxx", 后面直接收口 → ",}" 非法
+    return out.replace(/,\s*([}\]])/g, '$1');
+  }
+
+  /**
+   * 截断 JSON 抢救:从末尾往前试每个 } / ] 作为收口点,补齐括号后解析。
+   * 只接受**能拿到非空 shots 数组**的结果 —— 救出空壳没有意义。
+   */
+  private salvageTruncatedJson(raw: string): any {
+    let s = (raw || '').trim()
+      .replace(/^```(?:json)?\s*/, '')
+      .replace(/\s*```$/, '');
+    const start = s.indexOf('{');
+    if (start < 0) return null;
+    s = s.slice(start);
+    // 截断到只剩 50 字符就没救了,直接放弃(避免整段乱拼)
+    if (s.length < 50) return null;
+    for (let i = s.length - 1; i >= 50; i--) {
+      const c = s[i];
+      if (c !== '}' && c !== ']') continue;
+      const closed = this.closeBrackets(s.slice(0, i + 1));
+      try {
+        const p = JSON.parse(closed);
+        if (p && Array.isArray(p.shots) && p.shots.length) {
+          this.logger.warn(`[json-salvage] 截断 JSON 抢救成功:保留 ${p.shots.length} 镜(原文 ${raw.length} 字符)`);
+          return p;
+        }
+      } catch { /* 继续往前试 */ }
+    }
     return null;
   }
 

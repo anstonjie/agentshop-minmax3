@@ -29,6 +29,8 @@ import 'episode_step_views.dart';
 import '../../main.dart' show AppRoute;
 import '../../theme/app_dimens.dart';
 import '../../utils/app_toast.dart';
+import '../../widgets/workbench_form.dart';
+import '../../i18n/i18n.dart';
 class DramaEpisodePage extends StatefulWidget {
   final String dramaUuid;
   final int epNo;
@@ -45,13 +47,13 @@ class DramaEpisodePage extends StatefulWidget {
 class _DramaEpisodePageState extends State<DramaEpisodePage> {
   final ApiClient _api = ApiClient();
 
-  static const List<StepItem> steps = [
-    StepItem(label: '承接大纲', subtitle: '接住上集钩子'),
-    StepItem(label: '资产预检', subtitle: '复用 / 新增'),
-    StepItem(label: '分镜脚本', subtitle: '引用资产标识'),
-    StepItem(label: '关键帧', subtitle: '参考图驱动'),
-    StepItem(label: '分镜视频', subtitle: '逐镜生成'),
-    StepItem(label: '成片回写', subtitle: '合成 + 记忆'),
+  static final List<StepItem> steps = [
+    StepItem(label: tr('drama.episode.t01'), subtitle: tr('drama.episode.t02')),
+    StepItem(label: tr('drama.episode.t03'), subtitle: tr('drama.episode.t04')),
+    StepItem(label: tr('drama.episode.t05'), subtitle: tr('drama.episode.t06')),
+    StepItem(label: tr('drama.episode.t07'), subtitle: tr('drama.episode.t08')),
+    StepItem(label: tr('drama.episode.t09'), subtitle: tr('drama.episode.t10')),
+    StepItem(label: tr('drama.episode.t11'), subtitle: tr('drama.episode.t12')),
   ];
 
   Map<String, dynamic> _episode = const {};
@@ -295,16 +297,16 @@ class _DramaEpisodePageState extends State<DramaEpisodePage> {
     final res = await showDialog<String>(
       context: context,
       builder: (c) => AlertDialog(
-        title: const Text('改这条字幕', style: TextStyle(fontSize: 15)),
+        title: Text(tr('drama.episode.t13'), style: const TextStyle(fontSize: 15)),
         content: TextField(
           controller: ctrl, maxLines: 3, autofocus: true,
           style: AppTextStyles.bodySmall,
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(c), child: const Text('取消')),
+          TextButton(onPressed: () => Navigator.pop(c), child: Text(tr('common.cancel'))),
           FilledButton(
             onPressed: () => Navigator.pop(c, ctrl.text),
-            child: const Text('记下修改'),
+            child: Text(tr('drama.episode.t14')),
           ),
         ],
       ),
@@ -349,18 +351,19 @@ class _DramaEpisodePageState extends State<DramaEpisodePage> {
         ),
         centerTitle: true,
         leading: IconButton(
+          tooltip: tr('common.back'),
           icon: const Icon(Icons.arrow_back_ios_new),
           onPressed: () => Navigator.of(context).maybePop(),
         ),
         actions: [
           if (widget.epNo > 1)
             IconButton(
-              tooltip: '上一集',
+              tooltip: tr('drama.episode.t15'),
               icon: const Icon(Icons.chevron_left),
               onPressed: _busy ? null : () => _switchEpisode(widget.epNo - 1),
             ),
           IconButton(
-            tooltip: '刷新',
+            tooltip: tr('common.refresh'),
             icon: const Icon(Icons.refresh),
             onPressed: _busy ? null : _loadAll,
           ),
@@ -415,7 +418,7 @@ class _DramaEpisodePageState extends State<DramaEpisodePage> {
               padding: const EdgeInsets.fromLTRB(AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.md),
               child: Row(
                 children: [
-                  Text('步骤 ${_current + 1}/${steps.length}',
+                  Text(tr('drama.episode.t16', args: {'cur': '${_current + 1}', 'total': '${steps.length}'}),
                       style: AppTextStyles.labelSmall.copyWith(
                           color: AppColors.primary, fontWeight: FontWeight.w700)),
                   const SizedBox(width: AppSpacing.sm),
@@ -525,14 +528,14 @@ class _DramaEpisodePageState extends State<DramaEpisodePage> {
             IconButton(
               onPressed: _busy ? null : () => _deleteOutput(_current),
               icon: Icon(Icons.delete_outline, color: AppColors.danger),
-              tooltip: '清除本步产出',
+              tooltip: tr('drama.episode.t17'),
             ),
           Expanded(
             child: canConfirm
                 ? OutlinedButton.icon(
                     onPressed: _busy ? null : () => _confirm(_current),
                     icon: const Icon(Icons.check_circle_outline, size: 17),
-                    label: const Text('确认并进入下一步'),
+                    label: Text(tr('drama.episode.t18')),
                     style: OutlinedButton.styleFrom(
                       foregroundColor: AppColors.success,
                       padding: const EdgeInsets.symmetric(vertical: AppSpacing.md),
@@ -541,7 +544,7 @@ class _DramaEpisodePageState extends State<DramaEpisodePage> {
                 : ElevatedButton.icon(
                     onPressed: _busy ? null : () => _generate(_current, body: _bodyForStep()),
                     icon: const Icon(Icons.auto_awesome, size: 17),
-                    label: Text(out.isEmpty ? '生成「${steps[_current].label}」' : '重新生成本步'),
+                    label: Text(out.isEmpty ? tr('drama.episode.auto_001', args: {'steps': steps[_current].label}) : tr('drama.episode.auto_002')),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: AppColors.primary,
                       foregroundColor: AppColors.surface,
@@ -559,21 +562,19 @@ class _DramaEpisodePageState extends State<DramaEpisodePage> {
       child: Container(
         color: Colors.black.withValues(alpha: 0.45),
         child: Center(
-          child: Card(
+          child: WbCard(
             margin: const EdgeInsets.symmetric(horizontal: AppSpacing.jumbo),
-            child: Padding(
-              padding: const EdgeInsets.all(AppSpacing.xxl),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const CircularProgressIndicator(),
-                  const SizedBox(height: AppSpacing.lg),
-                  Text(_busyText, style: AppTextStyles.bodyMedium),
-                  const SizedBox(height: AppSpacing.sm),
-                  Text('图像与视频步可逐镜推进,不必等整集跑完',
-                      style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
-                ],
-              ),
+            padding: const EdgeInsets.all(AppSpacing.xxl),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const CircularProgressIndicator(),
+                const SizedBox(height: AppSpacing.lg),
+                Text(_busyText, style: AppTextStyles.bodyMedium),
+                const SizedBox(height: AppSpacing.sm),
+                Text(tr('drama.episode.t19'),
+                    style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
+              ],
             ),
           ),
         ),

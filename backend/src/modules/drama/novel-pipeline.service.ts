@@ -212,6 +212,19 @@ export class NovelPipelineService implements OnApplicationBootstrap {
       const n = await this.sweepOrphanedProducingGates();
       if (n) this.logger.log(`[pipeline] 定时扫描收尾 ${n} 个孤儿 producing 门`);
       await this.reportStalledGates();
+      // 连集队列 concurrency=1,一个带锁的僵尸 active job 会让之后所有批次
+      // 排不上队(接口回"已入队"但一步不跑)。这里顺带巡检并清理。
+      const z = await this.orchestrator.sweepZombieDramaSlots().catch(() => 0);
+      if (z) this.logger.warn(`[pipeline] 定时巡检清理 ${z} 个僵尸连集槽位`);
+      // 账本欠账:新完成的集会不断产生"待回填覆盖"的 beat,必须持续自愈,
+      // 否则 check:coverage 会把已拍的情节一直报成"还没安排上镜"。
+      const d = await this.ledger.sweepLedgerDebts().catch(() => null);
+      if (d && d.ledgers) {
+        this.logger.warn(
+          `[pipeline] 定时巡检自愈 ${d.ledgers} 份账本` +
+          `(清 ${d.pairsCleared} 个伏笔键,回填 ${d.beatsCovered} 个覆盖)`,
+        );
+      }
     } catch (e: any) {
       this.logger.warn(`[pipeline] 定时门扫描失败(不影响服务): ${e?.message}`);
     } finally {

@@ -41,7 +41,9 @@ import '../utils/web_download.dart';
 import '../widgets/agent_cost_banner.dart';
 import '../widgets/workbench_form.dart';
 import '../theme/app_dimens.dart';
+import '../utils/poll_timer.dart';
 import '../utils/app_toast.dart';
+import '../i18n/i18n.dart';
 
 class NovelDramaWorkbenchPage extends StatefulWidget {
   /// 发起新生成 / 新建剧时用得到;按 dramaUuid 恢复旧项目时可以为 0。
@@ -124,6 +126,19 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
   /// 一次性自重排(不用 Timer.periodic):跑批到终态后自然就不再排下一次
   Timer? _portraitTimer;
 
+  // 连集分集与分镜可视化(2026-09-20 优化):
+  // 让用户在主工作台就能看清每集的分镜、台词、关键帧、缺镜情况,并直接行内微调重烧字幕或补做缺镜。
+  List<Map<String, dynamic>> _episodes = [];
+  bool _episodesLoading = false;
+  bool _episodesExpanded = true;
+  int? _supplementingEp;
+  int? _reburningEp;
+  int? _expandedEpNo;
+
+  // 分集时长计划(GET /dramas/:uuid/novel/plan):后端按原著逐集折算的内容估时,
+  // 报价门里据此罗列"能出几集 / 每集大概多长"。拿不到不影响其余渲染。
+  Map<String, dynamic>? _plan;
+
   @override
   void initState() {
     super.initState();
@@ -201,13 +216,15 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       _error = null;
       _assets = [];
       _assetsLoaded = false;
+      _episodes = [];
+      _expandedEpNo = null;
       _resetPortraitView();
     });
     await _refreshLedger();
     if (!mounted) return;
     if (_ledger == null) {
       setState(() => _dramaUuid = null);
-      _toast('这个项目没有对齐账本,可能已被删除', error: true);
+      _toast(tr('novel_drama.toast_no_ledger'), error: true);
       return;
     }
     _syncStagePolling();
@@ -278,7 +295,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
   Future<void> _startGen() async {
     final title = _genTitleCtrl.text.trim();
     if (title.length < 2) {
-      _toast('标题至少 2 个字', error: true);
+      _toast(tr('novel_drama.toast_title_too_short'), error: true);
       return;
     }
     setState(() { _genStarting = true; _error = null; });
@@ -294,7 +311,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         _genTask = (r is Map) ? Map<String, dynamic>.from(r) : null;
       });
       _startPolling();
-      _toast('小说生成已启动,AI 正在构建世界观');
+      _toast(tr('novel_drama.toast_gen_started'));
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = _errMsg(e));
@@ -305,7 +322,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
 
   void _startPolling() {
     _pollTimer?.cancel();
-    _pollTimer = Timer.periodic(const Duration(seconds: 5), (_) => _pollGen());
+    // 2026-09-20:改用 PollTimer —— 退后台/切标签页时暂停 tick,回前台补一次;底层仍是 Timer.periodic,取消写法不变。
+    _pollTimer = PollTimer(const Duration(seconds: 5), (_) => _pollGen());
   }
 
   Future<void> _pollGen() async {
@@ -319,12 +337,12 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       setState(() => _genTask = Map<String, dynamic>.from(r));
       if (status == 'completed') {
         _pollTimer?.cancel();
-        _toast('小说生成完成,正在进入对齐引擎…');
+        _toast(tr('novel_drama.toast_gen_done'));
         await _ingestGenerated(Map<String, dynamic>.from(r));
       } else if (status == 'failed') {
         _pollTimer?.cancel();
         setState(() => _error =
-            '生成失败:${r['error'] ?? '未知原因'}(可换个标题或缩小规模重试)');
+            tr('novel_drama.error_gen_failed', args: {'reason': '${r['error'] ?? tr('novel_drama.unknown_reason')}'}));
       }
     } catch (_) {
       // 轮询失败不打断,下个周期重试
@@ -346,7 +364,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         'topic': 'novel-to-drama',
       }));
       final uuid = (created is Map) ? created['uuid']?.toString() : null;
-      if (uuid == null) throw Exception('建剧失败:返回体缺 uuid');
+      if (uuid == null) throw Exception(tr('novel_drama.build_drama_no_uuid'));
       final ingest = _unwrap(await _api.dio.post(
         '/dramas/$uuid/novel/ingest',
         data: {
@@ -361,7 +379,10 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         _dramaUuid = uuid;
         _ledger = (ingest is Map) ? Map<String, dynamic>.from(ingest) : null;
       });
-      _toast('对齐账本已生成,请确认报价单');
+      _toast(tr('novel_drama.toast_ledger_ready'));
+      // ingest 成功 → 后台 beats/重排可能正在跑(payload.repacking):开轮询,
+      // 标志一清就恢复门①双钮(见 _stageActive / _buildActionsBar)。
+      _syncStagePolling();
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = _errMsg(e));
@@ -376,11 +397,11 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     final novel = _novelCtrl.text.trim();
     final title = _titleCtrl.text.trim();
     if (title.isEmpty) {
-      _toast('请填写作品名', error: true);
+      _toast(tr('novel_drama.toast_need_title'), error: true);
       return;
     }
     if (novel.length < 50) {
-      _toast('小说正文太短(至少 50 字)', error: true);
+      _toast(tr('novel_drama.toast_text_too_short'), error: true);
       return;
     }
     setState(() { _submitting = true; _error = null; });
@@ -392,7 +413,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       }));
       final uuid = (created is Map) ? created['uuid']?.toString() : null;
       if (uuid == null || uuid.isEmpty) {
-        throw Exception('建剧失败:返回体缺 uuid');
+        throw Exception(tr('novel_drama.build_drama_no_uuid'));
       }
       final ledger = _unwrap(await _api.dio.post(
         '/dramas/$uuid/novel/ingest',
@@ -409,7 +430,10 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         _ledger = (ledger is Map) ? Map<String, dynamic>.from(ledger) : null;
       });
       AgentCostBanner.refreshAllFor(widget.agentId);
-      _toast('对齐账本已生成,请确认报价单');
+      _toast(tr('novel_drama.toast_ledger_ready'));
+      // ingest 成功 → 后台 beats/重排可能正在跑(payload.repacking):开轮询,
+      // 标志一清就恢复门①双钮(见 _stageActive / _buildActionsBar)。
+      _syncStagePolling();
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = _errMsg(e));
@@ -434,7 +458,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       setState(() {
         _ledger = (r is Map) ? Map<String, dynamic>.from(r) : _ledger;
       });
-      _toast(pass ? '已通过' : '已驳回,可调整后重报');
+      _toast(pass ? tr('novel_drama.gate_passed') : tr('novel_drama.gate_rejected_adjust'));
     } catch (e) {
       if (!mounted) return;
       _toast(_errMsg(e), error: true);
@@ -453,7 +477,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       await _api.dio.post('/dramas/$_dramaUuid/novel/gates/$gate/retry');
       _api.invalidate('/dramas/$_dramaUuid/novel/ledger');
       await _refreshLedger();
-      _toast('已重新拉起生成,进度稍后刷新');
+      _toast(tr('novel_drama.toast_regen_ok'));
     } catch (e) {
       if (!mounted) return;
       _toast(_errMsg(e), error: true);
@@ -490,7 +514,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       setState(() {
         _ledger = (r is Map) ? Map<String, dynamic>.from(r) : _ledger;
       });
-      _toast('已改回待确认,可重新决策');
+      _toast(tr('novel_drama.toast_gate_reopened'));
     } catch (e) {
       if (!mounted) return;
       _toast(_errMsg(e), error: true);
@@ -518,7 +542,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
   Future<void> _setBatchStatus(String status, String okMsg) async {
     final bu = _batchUuid;
     if (bu == null) {
-      _toast('没找到批次号,请到剧集详情页操作', error: true);
+      _toast(tr('novel_drama.toast_no_batch'), error: true);
       return;
     }
     setState(() => _projectBusy = true);
@@ -560,12 +584,12 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       }
       final url = (hit?['finalUrl'] ?? '').toString();
       if (url.isEmpty) {
-        _toast('还没有可播放的成片', error: true);
+        _toast(tr('novel_drama.toast_no_film'), error: true);
         return;
       }
       await webOpenInNewTab(Uri.parse(ApiClient.resolveUrl(url)));
       if (!mounted) return;
-      _toast('已在新标签页打开 EP${hit?['epNo'] ?? ''} 成片');
+      _toast(tr('novel_drama.toast_opened_film', args: {'ep': '${hit?['epNo'] ?? ''}'}));
     } catch (e) {
       if (!mounted) return;
       _toast(_errMsg(e), error: true);
@@ -583,22 +607,21 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
   Future<void> _deleteProject() async {
     final uuid = _dramaUuid;
     if (uuid == null) return;
-    final title = _ledger?['novelTitle']?.toString() ?? '这个项目';
+    final title = _ledger?['novelTitle']?.toString() ?? tr('novel_drama.fallback_this_project');
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('删除项目'),
-        content: Text('将永久删除「$title」:小说账本、已生成的角色/场景资产、'
-            '全部逐集产物与成片都会一并清掉,无法恢复。\n\n确定删除吗?'),
+        title: Text(tr('novel_drama.delete_project')),
+        content: Text(tr('novel_drama.dialog_delete_body', args: {'title': title})),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
+            child: Text(tr('common.cancel')),
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
             style: TextButton.styleFrom(foregroundColor: AppColors.danger),
-            child: const Text('永久删除'),
+            child: Text(tr('novel_drama.delete_forever')),
           ),
         ],
       ),
@@ -609,7 +632,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       await _api.dio.delete('/dramas/$uuid', options: _fresh);
       _api.invalidate('/dramas/novel/active');
       if (!mounted) return;
-      _toast('项目已删除');
+      _toast(tr('novel_drama.toast_project_deleted'));
       _backToStart();
     } catch (e) {
       if (!mounted) return;
@@ -628,7 +651,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
   Future<void> _resumeBatch() async {
     final bu = _batchUuid;
     if (bu == null) {
-      _toast('没找到批次号,请到剧集详情页续跑', error: true);
+      _toast(tr('novel_drama.toast_no_batch_resume'), error: true);
       return;
     }
     setState(() => _deciding = true);
@@ -639,9 +662,9 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         options: _fresh,
       ));
       if (r is Map && r['enqueued'] == false) {
-        _toast('未能续跑:${r['reason'] ?? '队列不可用'}', error: true);
+        _toast(tr('novel_drama.toast_resume_failed', args: {'reason': '${r['reason'] ?? tr('novel_drama.queue_unavailable')}'}), error: true);
       } else {
-        _toast('已重新入队,从断点续跑');
+        _toast(tr('novel_drama.toast_requeued'));
       }
       if (r is Map) setState(() => _batch = Map<String, dynamic>.from(r));
     } catch (e) {
@@ -806,6 +829,14 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         _maybeLoadAssets();
       }
     } catch (_) {}
+    // 分集时长计划:独立拉一次,失败就保留上一次(或空),不影响报价门其余渲染
+    try {
+      final p = _unwrap(await _api.dio.get('/dramas/$_dramaUuid/novel/plan',
+          options: _fresh));
+      if (mounted && p is Map) {
+        setState(() => _plan = Map<String, dynamic>.from(p));
+      }
+    } catch (_) {}
   }
 
   // ── Stage 2 流水线轮询 ────────────────────────────────────────────────
@@ -844,13 +875,13 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       children: [
         if (mins != null && mins >= 2) ...[
           Text(
-            '已经 $mins 分钟没有新进展 · 后端进程重启会丢掉生成循环,可重新拉起',
+            tr('novel_drama.auto_001', args: {'mins': '$mins'}),
             style: AppTextStyles.labelSmall.copyWith(color: AppColors.warning),
           ),
           const SizedBox(height: AppSpacing.sm),
         ],
         _GateMiniButton(
-          label: '长时间无响应?点此重新拉起',
+          label: tr('novel_drama.toast_unresponsive_btn'),
           icon: Icons.refresh_rounded,
           color: AppColors.textSecondary,
           busy: _deciding,
@@ -864,6 +895,10 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
   /// payload 还没落 generating 的短暂空窗)
   bool get _stageActive {
     if (_ledger == null) return false;
+    // 门①后台 beats/重排进行中(payload.repacking):这期间 decideGate 会被后端
+    // 409 拦下,前端把双钮禁用。必须轮询刷 payload —— 否则后台清标志后按钮
+    // 仍是禁用态,用户得手动刷新页面才能确认报价(2026-09-21 实测卡死事故)。
+    if (_gatePayload('gate1_budget')?['repacking'] == true) return true;
     if (_gateOf('gate1_budget')?['status'] != 'passed') return false;
     final g2 = _gateOf('gate2_design')?['status']?.toString();
     final g3 = _gateOf('gate3_script')?['status']?.toString();
@@ -893,7 +928,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     if (_stageActive) {
       if (_payloadEmpty) _idlePolls++;
       _stageTimer?.cancel();
-      _stageTimer = Timer.periodic(const Duration(seconds: 4), (_) => _pollStage());
+      _stageTimer = PollTimer(const Duration(seconds: 4), (_) => _pollStage());
     } else {
       _idlePolls = 0;
       _stageTimer?.cancel();
@@ -911,7 +946,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     await _refreshLedger();
     final p3 = _gatePayload('gate3_script');
     final bu = p3?['batchUuid']?.toString();
-    if (p3?['state'] == 'producing' && bu != null && bu.isNotEmpty) {
+    if ((p3?['state'] == 'producing' || _batch != null) && bu != null && bu.isNotEmpty) {
       try {
         final r = _unwrap(
             await _api.dio.get('/dramas/batches/$bu', options: _fresh));
@@ -919,6 +954,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           setState(() => _batch = Map<String, dynamic>.from(r));
         }
       } catch (_) {}
+      // 生产中顺便拉取各集分镜明细
+      await _loadEpisodes();
     }
     _syncStagePolling();
   }
@@ -939,12 +976,19 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             name.replaceAll(RegExp(r'\.txt$', caseSensitive: false), '');
       }
     });
-    _toast('已读入 $name(共 ${text.length} 字)');
+    _toast(tr('novel_drama.toast_file_loaded', args: {'name': name, 'chars': '${text.length}'}));
   }
 
   void _toast(String msg, {bool error = false}) {
     if (!mounted) return;
-    AppToast.success(context, msg);
+    // error:true 必须走 error 样式(危险色)。以前恒走 success,409/失败提示和
+    // 成功反馈同一个色,用户根本分不出好坏(2026-09-21 截图事故:后端 409 的
+    // 「正在重算报价」弹成了深色"成功"条)。msg 是最终文本,raw: true 不再过 tr()。
+    if (error) {
+      AppToast.show(context, msg, type: AppToastType.error, raw: true);
+    } else {
+      AppToast.success(context, msg);
+    }
   }
 
   // ── UI ────────────────────────────────────────────────────────────────
@@ -956,13 +1000,13 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       appBar: AppBar(
         backgroundColor: AppColors.surface,
         title: Text(
-          widget.agentName ?? '全新短视频一键生成',
+          widget.agentName ?? tr('novel_drama.default_agent_name'),
           style: AppTextStyles.titleMedium,
         ),
         actions: [
           // 2026-09-14:全部小说书架入口(含历史生成,不依赖当前页状态)
           IconButton(
-            tooltip: '我的小说',
+            tooltip: tr('mine.my_novels'),
             onPressed: () =>
                 Navigator.pushNamed(context, AppRoute.novelLibrary),
             icon: const Icon(Icons.local_library_rounded),
@@ -971,7 +1015,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           // 没有任何入口能回到某部剧,库里 20+ 个项目因此卡在门上打不开。
           // 这里补「我的剧集」,与「我的小说」一前一后覆盖两个阶段。
           IconButton(
-            tooltip: '我的剧集',
+            tooltip: tr('novel_drama.my_dramas'),
             onPressed: () => Navigator.pushNamed(context, AppRoute.dramaList,
                 arguments: {
                   'agentId': widget.agentId,
@@ -987,11 +1031,11 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                 labelColor: AppColors.primary,
                 unselectedLabelColor: AppColors.textSecondary,
                 indicatorColor: AppColors.primary,
-                tabs: const [
-                  Tab(icon: Icon(Icons.auto_awesome_rounded, size: 18),
-                      text: 'AI 生成小说'),
-                  Tab(icon: Icon(Icons.menu_book_rounded, size: 18),
-                      text: '我有小说'),
+                tabs: [
+                  Tab(icon: const Icon(Icons.auto_awesome_rounded, size: 18),
+                      text: tr('novel_drama.tab_ai_novel')),
+                  Tab(icon: const Icon(Icons.menu_book_rounded, size: 18),
+                      text: tr('novel_drama.tab_my_novel')),
                 ],
               ),
       ),
@@ -1002,11 +1046,10 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               : Column(
                   children: [
                     const SizedBox(height: AppSpacing.md),
-                    const WbInfoCard(
+                    WbInfoCard(
                       icon: Icons.auto_stories_rounded,
                       text:
-                          '从一个标题或一本完整小说出发,一键产出可发布的完整竖屏短剧。'
-                          '小说有多长,短剧就有多长 —— 先给你报价单,确认了才开做。',
+                          tr('novel_drama.hero_body'),
                     ),
                     const SizedBox(height: AppSpacing.sm),
                     // 2026-09-15:未完成项目清单。放在 TabBarView 之外,
@@ -1035,36 +1078,36 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     'gate3_script': '③ 分集剧本',
   };
 
-  String _gateNameOf(String? gate) => _gateNames[gate] ?? '生产';
+  String _gateNameOf(String? gate) => _gateNames[gate] ?? tr('novel_drama.gate_name_producing');
 
   /// 后端 listActiveProjects 的 reason → 一句人话(说清卡在哪、能干什么)
   String _reasonOf(Map<String, dynamic> p) {
     final gate = _gateNameOf(p['currentGate']?.toString());
     switch (p['reason']?.toString()) {
       case 'generating':
-        return '$gate 正在生成中';
+        return tr('novel_drama.reason_generating', args: {'gate': gate});
       case 'failed':
-        return '$gate 生成中断,可重拉';
+        return tr('novel_drama.reason_failed', args: {'gate': gate});
       case 'producing':
         final b = p['batch'];
         final cur = b is Map ? _asInt(b['cursorEp']) : null;
         final to = b is Map ? _asInt(b['toEp']) : null;
         return cur != null && to != null && to > 0
-            ? '连集生产中 · 已到第 $cur/$to 集'
-            : '连集生产中';
+            ? tr('novel_drama.reason_producing', args: {'cur': '$cur', 'to': '$to'})
+            : tr('novel_drama.reason_producing_plain');
       case 'rejected':
         // 别说"可重做":retry 只重跑生成阶段,不会把门从 rejected 拉回来
         // (后端 decideGate 对非 waiting 直接抛 Conflict)。真正要做的是
         // 「重新打开此门」,所以文案必须指那一个动作,否则用户点进去只会碰壁。
-        return '$gate 已驳回,可重新打开';
+        return tr('novel_drama.reason_rejected', args: {'gate': gate});
       case 'stopped':
-        return '生产已停止,可续跑';
+        return tr('novel_drama.reason_stopped');
       case 'not_started':
-        return '三道门已过,生产未启动';
+        return tr('novel_drama.reason_not_started');
       default:
         return p['currentGate']?.toString() == 'gate1_budget'
-            ? '$gate 等你确认'
-            : '$gate 已生成,等你过门';
+            ? tr('novel_drama.reason_waiting', args: {'gate': gate})
+            : tr('novel_drama.reason_ready', args: {'gate': gate});
     }
   }
 
@@ -1094,14 +1137,14 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               Icon(Icons.history_rounded, size: 18, color: AppColors.primary),
               const SizedBox(width: AppSpacing.sm),
               Expanded(
-                child: Text('未完成的项目($totalCount)',
+                child: Text(tr('novel_drama.active_projects_title', args: {'n': '$totalCount'}),
                     style: AppTextStyles.titleSmall),
               ),
             ],
           ),
           const SizedBox(height: AppSpacing.xs),
           Text(
-            '上次没做完的都在这儿,点一下直接回到当时那一步接着做。',
+            tr('novel_drama.active_projects_subtitle'),
             style: AppTextStyles.caption
                 .copyWith(color: AppColors.textSecondary),
           ),
@@ -1112,8 +1155,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             Padding(
               padding: const EdgeInsets.fromLTRB(AppSpacing.xxs, AppSpacing.xxs, 0, AppSpacing.sm),
               child: Text(
-                '还有 ${_activeProjects.length - shown.length} 个 · '
-                '点右上角「我的剧集」看全部',
+                tr('novel_drama.active_projects_more', args: {'n': '${_activeProjects.length - shown.length}'}),
                 style: AppTextStyles.caption
                     .copyWith(color: AppColors.textTertiary),
               ),
@@ -1127,7 +1169,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
   /// 点击才把该任务设成 _genTask(显示失败卡 + 「从断点重试」/「换个标题重来」),
   /// 进页面时不自动显示 —— 与 _restore 的「只接管 running」配套。
   Widget _pausedGenRow(Map<String, dynamic> t) {
-    final title = t['title']?.toString() ?? '未命名小说';
+    final title = t['title']?.toString() ?? tr('novel_drama.untitled_novel');
     final failed = t['status'] == 'failed';
     final chDone = t['chaptersDone'] ?? 0;
     final chTotal = t['chaptersTotal'] ?? 0;
@@ -1157,8 +1199,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                   ),
                   const SizedBox(height: AppSpacing.xxs),
                   Text(
-                    '${failed ? '生成失败' : '已中断'} · 第 $chDone/$chTotal 章 · '
-                    '点查看原因 / 从断点重试',
+                    tr('novel_drama.novel_status_line', args: {'state': failed ? tr('novel_drama.gen_failed') : tr('novel_drama.interrupted'), 'done': '$chDone', 'total': '$chTotal'}),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: AppTextStyles.caption
@@ -1190,7 +1231,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    p['title']?.toString() ?? '未命名项目',
+                    p['title']?.toString() ?? tr('novel_drama.untitled_project'),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: AppTextStyles.bodySmall
@@ -1199,8 +1240,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                   const SizedBox(height: AppSpacing.xs),
                   Text(
                     '${_reasonOf(p)}'
-                    '${chars > 0 ? ' · $chars 字' : ''}'
-                    '${eps > 0 ? ' · $eps 集' : ''}',
+                    '${chars > 0 ? tr('novel_drama.project_meta_chars', args: {'n': '$chars'}) : ''}'
+                    '${eps > 0 ? tr('novel_drama.project_meta_eps', args: {'n': '$eps'}) : ''}',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: AppTextStyles.caption
@@ -1210,7 +1251,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               ),
             ),
             const SizedBox(width: AppSpacing.sm),
-            Text('继续',
+            Text(tr('novel_drama.continue_btn'),
                 style: AppTextStyles.caption.copyWith(
                     color: AppColors.primary, fontWeight: FontWeight.w800)),
             const SizedBox(width: AppSpacing.xxs),
@@ -1233,44 +1274,44 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         children: [
           if (task == null || !running) ...[
             WbTextField(
-              label: '小说标题',
-              hint: '如:斗破苍穹之绝世丹帝',
+              label: tr('novel_drama.novel_title_label'),
+              hint: tr('novel_drama.novel_title_hint'),
               controller: _genTitleCtrl,
               icon: Icons.drive_file_rename_outline_rounded,
               required: true,
             ),
             const SizedBox(height: AppSpacing.md),
             WbTextField(
-              label: '类型(可选)',
-              hint: '玄幻 / 都市 / 悬疑 / 古言 / 科幻…留空由 AI 判断',
+              label: tr('novel_drama.genre_label'),
+              hint: tr('novel_drama.genre_hint'),
               controller: TextEditingController(text: _genGenre),
               icon: Icons.category_rounded,
               onChanged: (v) => _genGenre = v.trim(),
             ),
             const SizedBox(height: AppSpacing.md),
             WbDropdown<String>(
-              label: '小说规模',
+              label: tr('novel_drama.scale_label'),
               value: _tier,
-              items: const [
+              items: [
                 WbDropdownItem(
-                    value: 'demo', label: '试写 2 万字(约 10 章,先看效果)'),
+                    value: 'demo', label: tr('novel_drama.scale_demo')),
                 WbDropdownItem(
-                    value: 'novella', label: '中篇 20 万字(约 80 章)'),
+                    value: 'novella', label: tr('novel_drama.scale_novella')),
                 WbDropdownItem(
-                    value: 'full', label: '长篇 80 万字(约 267 章,数小时)'),
+                    value: 'full', label: tr('novel_drama.scale_full')),
               ],
               onChanged: (v) => setState(() => _tier = v),
               icon: Icons.library_books_rounded,
             ),
             const SizedBox(height: AppSpacing.md),
             WbDropdown<String>(
-              label: '单集目标时长',
+              label: tr('novel_drama.ep_target_label'),
               value: _epTarget,
-              items: const [
-                WbDropdownItem(value: '60', label: '60 秒(快节奏)'),
-                WbDropdownItem(value: '90', label: '90 秒'),
-                WbDropdownItem(value: '120', label: '120 秒(推荐)'),
-                WbDropdownItem(value: '180', label: '180 秒(慢热)'),
+              items: [
+                WbDropdownItem(value: '60', label: tr('novel_drama.ep_60')),
+                WbDropdownItem(value: '90', label: tr('novel_drama.ep_90')),
+                WbDropdownItem(value: '120', label: tr('novel_drama.ep_120')),
+                WbDropdownItem(value: '180', label: tr('novel_drama.ep_180')),
               ],
               onChanged: (v) => setState(() => _epTarget = v),
               icon: Icons.timer_outlined,
@@ -1290,8 +1331,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             AgentCostBanner.compact(agentId: widget.agentId),
             const SizedBox(height: AppSpacing.md),
             WbSubmitButton(
-              label: '一键生成小说 + 短剧',
-              loadingLabel: '正在启动生成引擎…',
+              label: tr('novel_drama.gen_btn'),
+              loadingLabel: tr('novel_drama.gen_btn_loading'),
               icon: Icons.auto_awesome_rounded,
               loading: _genStarting,
               disabled: _genStarting,
@@ -1299,8 +1340,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             ),
             const SizedBox(height: AppSpacing.sm),
             Text(
-              'AI 五级瀑布:解析题材 → 构建世界观 → 规划分卷 → 排章纲 → 逐章写作;'
-              '写完自动进入对齐引擎出报价单,全程可试读。',
+              tr('novel_drama.gen_hint'),
               style: AppTextStyles.labelSmall
                   .copyWith(color: AppColors.textTertiary),
             ),
@@ -1346,7 +1386,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               const SizedBox(width: AppSpacing.sm),
               Expanded(
                 child: Text(
-                  failed ? '生成失败' : '「${task['title']}」生成中',
+                  failed ? tr('novel_drama.gen_failed') : tr('novel_drama.gen_running', args: {'title': '${task['title']}'}),
                   style: AppTextStyles.titleSmall,
                 ),
               ),
@@ -1368,7 +1408,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           ),
           const SizedBox(height: AppSpacing.md),
           Text(
-            '$stage · 第 $chDone/$chTotal 章 · 已写 $chars 字',
+            tr('novel_drama.gen_progress', args: {'stage': stage, 'done': '$chDone', 'total': '$chTotal', 'chars': '$chars'}),
             style: AppTextStyles.bodySmall
                 .copyWith(color: AppColors.textSecondary),
           ),
@@ -1391,7 +1431,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('试读(最新一章结尾)',
+                  Text(tr('novel_drama.preview_btn'),
                       style: AppTextStyles.labelSmall
                           .copyWith(color: AppColors.textTertiary)),
                   const SizedBox(height: AppSpacing.sm),
@@ -1409,7 +1449,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           if (task['uuid'] != null) ...[
             const SizedBox(height: AppSpacing.md),
             WbSubmitButton(
-              label: '阅读全文(Markdown 排版)',
+              label: tr('novel_drama.read_full_btn'),
               icon: Icons.menu_book_rounded,
               onTap: _openReader,
             ),
@@ -1420,7 +1460,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               Padding(
                 padding: const EdgeInsets.only(bottom: AppSpacing.md),
                 child: Text(
-                  '失败原因:${task['error']}',
+                  tr('novel_drama.fail_reason', args: {'reason': '${task['error']}'}),
                   style: AppTextStyles.bodySmall
                       .copyWith(color: AppColors.danger),
                 ),
@@ -1429,7 +1469,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               children: [
                 Expanded(
                   child: WbSubmitButton(
-                    label: '换个标题重来',
+                    label: tr('novel_drama.retry_new_title'),
                     icon: Icons.refresh_rounded,
                     disabled: _genStarting,
                     onTap: () => setState(() {
@@ -1442,8 +1482,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                 Expanded(
                   flex: 2,
                   child: WbSubmitButton(
-                    label: '从断点重试(已完成 $chDone 章不重写)',
-                    loadingLabel: '正在恢复生成…',
+                    label: tr('novel_drama.retry_from_checkpoint', args: {'n': '$chDone'}),
+                    loadingLabel: tr('novel_drama.retry_loading'),
                     icon: Icons.play_arrow_rounded,
                     loading: _genStarting,
                     disabled: _genStarting,
@@ -1480,7 +1520,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       if (r is Map) {
         setState(() => _genTask = Map<String, dynamic>.from(r));
         _startPolling();
-        _toast('已从断点恢复,继续生成');
+        _toast(tr('novel_drama.toast_gen_resumed'));
       }
     } catch (e) {
       if (!mounted) return;
@@ -1498,16 +1538,16 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           WbTextField(
-            label: '作品名',
-            hint: '如:斗破苍穹之绝世丹帝',
+            label: tr('novel_drama.work_name_label'),
+            hint: tr('novel_drama.novel_title_hint'),
             controller: _titleCtrl,
             icon: Icons.drive_file_rename_outline_rounded,
             required: true,
           ),
           const SizedBox(height: AppSpacing.md),
           WbTextArea(
-            label: '小说正文(粘贴或上传)',
-            hint: '粘贴完本小说正文,任意长度;一个字都不丢,每一集都能对回到原文',
+            label: tr('novel_drama.novel_text_label'),
+            hint: tr('novel_drama.novel_text_hint'),
             controller: _novelCtrl,
             maxLines: 8,
             required: true,
@@ -1524,11 +1564,11 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                 child: TextButton.icon(
                   onPressed: _pickNovelFile,
                   icon: const Icon(Icons.upload_file_rounded, size: 18),
-                  label: const Text('上传 .txt 文件'),
+                  label: Text(tr('novel_drama.upload_txt')),
                 ),
               ),
               Text(
-                '${_novelCtrl.text.length} 字',
+                tr('novel_drama.chars_unit', args: {'n': '${_novelCtrl.text.length}'}),
                 maxLines: 1, overflow: TextOverflow.ellipsis,
                 style: AppTextStyles.labelSmall
                     .copyWith(color: AppColors.textTertiary),
@@ -1537,13 +1577,13 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           ),
           const SizedBox(height: AppSpacing.md),
           WbDropdown<String>(
-            label: '单集目标时长',
+            label: tr('novel_drama.ep_target_label'),
             value: _epTarget,
-            items: const [
-              WbDropdownItem(value: '60', label: '60 秒(快节奏)'),
-              WbDropdownItem(value: '90', label: '90 秒'),
-              WbDropdownItem(value: '120', label: '120 秒(推荐)'),
-              WbDropdownItem(value: '180', label: '180 秒(慢热)'),
+            items: [
+              WbDropdownItem(value: '60', label: tr('novel_drama.ep_60')),
+              WbDropdownItem(value: '90', label: tr('novel_drama.ep_90')),
+              WbDropdownItem(value: '120', label: tr('novel_drama.ep_120')),
+              WbDropdownItem(value: '180', label: tr('novel_drama.ep_180')),
             ],
             onChanged: (v) => setState(() => _epTarget = v),
             icon: Icons.timer_outlined,
@@ -1563,8 +1603,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           AgentCostBanner.compact(agentId: widget.agentId),
           const SizedBox(height: AppSpacing.md),
           WbSubmitButton(
-            label: '生成对齐账本',
-            loadingLabel: 'AI 正在逐章建账本…',
+            label: tr('novel_drama.ingest_btn'),
+            loadingLabel: tr('novel_drama.ingest_loading'),
             icon: Icons.auto_awesome_rounded,
             loading: _submitting,
             disabled: _submitting,
@@ -1614,6 +1654,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       _error = null;
       _assets = [];
       _assetsLoaded = false;
+      _episodes = [];
+      _expandedEpNo = null;
       _idlePolls = 0;
     });
     // 清单要重拉:否则刚选择「保留」的项目不会出现在「未完成的项目」里
@@ -1632,27 +1674,25 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       _backToStart();
       return;
     }
-    final title = _ledger?['novelTitle']?.toString() ?? '当前项目';
+    final title = _ledger?['novelTitle']?.toString() ?? tr('novel_drama.fallback_current_project');
     final choice = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('开始新项目'),
-        content: Text('「$title」还没做完,要怎么处理它?\n\n'
-            '· 保留:它仍在「未完成的项目」里,随时点回来接着做\n'
-            '· 删除:账本、已生成的角色/场景资产、成片一起清掉,无法恢复'),
+        title: Text(tr('novel_drama.new_project_title')),
+        content: Text(tr('novel_drama.dialog_new_project_body', args: {'title': title})),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, 'cancel'),
-            child: const Text('取消'),
+            child: Text(tr('common.cancel')),
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, 'keep'),
-            child: const Text('保留并新建'),
+            child: Text(tr('novel_drama.keep_and_new')),
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, 'delete'),
             style: TextButton.styleFrom(foregroundColor: AppColors.danger),
-            child: const Text('删除并新建'),
+            child: Text(tr('novel_drama.delete_and_new')),
           ),
         ],
       ),
@@ -1663,7 +1703,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         await _api.dio.delete('/dramas/$uuid', options: _fresh);
         _api.invalidate('/dramas/novel/active');
         if (!mounted) return;
-        _toast('项目已删除');
+        _toast(tr('novel_drama.toast_project_deleted'));
       } catch (e) {
         // 删失败就**别清界面** —— 清了用户会以为删掉了,实际还留在库里
         if (mounted) _toast(_errMsg(e), error: true);
@@ -1688,7 +1728,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                   size: 15, color: AppColors.textTertiary),
               const SizedBox(width: AppSpacing.xs),
               Text(
-                '新建一个项目(回到起点)',
+                tr('novel_drama.new_project_cta'),
                 style: AppTextStyles.caption
                     .copyWith(color: AppColors.textTertiary),
               ),
@@ -1725,7 +1765,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               const SizedBox(width: AppSpacing.sm),
               Expanded(
                 child: Text(
-                  title == null || title.isEmpty ? '小说原文' : title,
+                  title == null || title.isEmpty ? tr('novel_drama.novel_original') : title,
                   style: AppTextStyles.titleSmall,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
@@ -1739,7 +1779,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                   borderRadius: BorderRadius.circular(AppColors.cardRadius),
                 ),
                 child: Text(
-                  uploaded ? '我上传的' : 'AI 生成',
+                  uploaded ? tr('novel_drama.source_uploaded') : tr('novel_drama.source_ai'),
                   style: AppTextStyles.labelSmall
                       .copyWith(color: AppColors.info),
                 ),
@@ -1748,14 +1788,13 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           ),
           const SizedBox(height: AppSpacing.md),
           Text(
-            '${chars == null ? '—' : '$chars'} 字 · 已入库对齐,原文一字不丢,'
-            '每一集都能对回原文。全文可直接阅读 / 下载 Markdown、TXT。',
+            tr('novel_drama.novel_meta', args: {'chars': chars == null ? '—' : chars.toString()}),
             style: AppTextStyles.bodySmall
                 .copyWith(color: AppColors.textSecondary),
           ),
           const SizedBox(height: AppSpacing.lg),
           WbSubmitButton(
-            label: '阅读全文(Markdown 排版)',
+            label: tr('novel_drama.read_full_btn'),
             icon: Icons.auto_stories_rounded,
             disabled: !hasText,
             onTap: _openLedgerReader,
@@ -1838,7 +1877,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                   size: 16, color: AppColors.primary),
               const SizedBox(width: AppSpacing.sm),
               Expanded(
-                child: Text('开跑前预估(按当前设定)',
+                child: Text(tr('novel_drama.estimate_title'),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: AppTextStyles.labelSmall.copyWith(
@@ -1850,18 +1889,16 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           const SizedBox(height: AppSpacing.sm),
           Row(
             children: [
-              Expanded(child: _StatCell(label: '预计集数', value: '$eps 集')),
-              Expanded(child: _StatCell(label: '预计镜头', value: '$shots 镜')),
+              Expanded(child: _StatCell(label: tr('novel_drama.est_eps_label'), value: tr('novel_drama.eps_unit', args: {'n': '$eps'}))),
+              Expanded(child: _StatCell(label: tr('novel_drama.est_shots_label'), value: tr('novel_drama.shots_unit', args: {'n': '$shots'}))),
               Expanded(
                   child:
-                      _StatCell(label: '预计积分', value: _grouped(credits))),
+                      _StatCell(label: tr('novel_drama.est_credits_label'), value: _grouped(credits))),
             ],
           ),
           const SizedBox(height: AppSpacing.sm),
           Text(
-            '按每万字约 ${_kEffPerWanChars.toStringAsFixed(1)} 分钟折算 · '
-            '每集约 $shotsPerEp 镜 · 确认报价单时会给出准确积分与预计耗时,'
-            '失败镜头不计费。',
+            tr('novel_drama.estimate_note', args: {'rate': _kEffPerWanChars.toStringAsFixed(1), 'shots': '$shotsPerEp'}),
             style: AppTextStyles.labelSmall
                 .copyWith(color: AppColors.textTertiary),
           ),
@@ -1902,8 +1939,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     final wallText = wallMin == null
         ? null
         : (wallMin >= 60
-            ? '${(wallMin / 60).toStringAsFixed(1)} 小时'
-            : '$wallMin 分钟');
+            ? tr('novel_drama.hours_unit', args: {'n': (wallMin / 60).toStringAsFixed(1)})
+            : tr('novel_drama.minutes_unit', args: {'n': '$wallMin'}));
 
     return Container(
       padding: const EdgeInsets.all(AppSpacing.xl),
@@ -1920,7 +1957,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               Icon(Icons.fact_check_outlined,
                   color: AppColors.primary, size: 20),
               const SizedBox(width: AppSpacing.sm),
-              Expanded(child: Text('🛑 审批门 ① 报价单', style: AppTextStyles.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis)),
+              Expanded(child: Text(tr('novel_drama.gate1_title'), style: AppTextStyles.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis)),
               const Spacer(),
               if (status != null) _GateStatusChip(status: status),
             ],
@@ -1930,10 +1967,10 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             Row(
               children: [
                 Expanded(
-                    child: _StatCell(label: '预计总时长', value: '$minutes 分钟')),
-                Expanded(child: _StatCell(label: '集数', value: '$eps 集')),
+                    child: _StatCell(label: tr('novel_drama.est_total_duration'), value: tr('novel_drama.minutes_unit', args: {'n': '$minutes'}))),
+                Expanded(child: _StatCell(label: tr('novel_drama.eps_label'), value: tr('novel_drama.eps_unit', args: {'n': '$eps'}))),
                 Expanded(
-                    child: _StatCell(label: '小说字数', value: '$chars 字')),
+                    child: _StatCell(label: tr('novel_drama.novel_chars_label'), value: tr('novel_drama.chars_unit', args: {'n': '$chars'}))),
               ],
             ),
             if (credits != null || shots != null || wallText != null) ...[
@@ -1942,15 +1979,15 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                 children: [
                   Expanded(
                       child: _StatCell(
-                          label: '预计积分',
+                          label: tr('novel_drama.est_credits_label'),
                           value: credits == null ? '—' : '$credits')),
                   Expanded(
                       child: _StatCell(
-                          label: '预计镜头',
-                          value: shots == null ? '—' : '$shots 镜')),
+                          label: tr('novel_drama.est_shots_label'),
+                          value: shots == null ? '—' : tr('novel_drama.shots_unit', args: {'n': '$shots'}))),
                   Expanded(
                       child: _StatCell(
-                          label: '预计耗时',
+                          label: tr('novel_drama.est_wall_label'),
                           value: wallText ?? '—')),
                 ],
               ),
@@ -1968,22 +2005,21 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                   children: [
                     if (epSec != null && shotsPerEp != null)
                       Text(
-                        '单集 $epSec 秒 · 约 $shotsPerEp 个镜头(每镜 8-12 秒)',
+                        tr('novel_drama.ep_spec', args: {'sec': '$epSec', 'shots': '$shotsPerEp'}),
                         style: AppTextStyles.labelSmall
                             .copyWith(color: AppColors.textSecondary),
                       ),
                     if (unit != null) ...[
                       const SizedBox(height: AppSpacing.xs),
                       Text(
-                        '计费单价:图 ${unit['image']} / 视频 ${unit['video']} / 文本 ${unit['llm']} 积分'
-                        '${keys != null ? ' · 视频通道 $keys 路' : ''}',
+                        '${tr('novel_drama.pricing_units', args: {'image': '${unit['image']}', 'video': '${unit['video']}', 'llm': '${unit['llm']}'})}${keys != null ? tr('novel_drama.video_channels', args: {'n': '$keys'}) : ''}',
                         style: AppTextStyles.labelSmall
                             .copyWith(color: AppColors.textTertiary),
                       ),
                     ],
                     const SizedBox(height: AppSpacing.xs),
                     Text(
-                      '积分是上限估算:失败的镜头不计费,实际消耗通常低于此值。',
+                      tr('novel_drama.credits_note'),
                       style: AppTextStyles.labelSmall
                           .copyWith(color: AppColors.textTertiary),
                     ),
@@ -1991,24 +2027,125 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                 ),
               ),
             ],
+            _buildEpisodePlan(),
             if (estimated) ...[
               const SizedBox(height: AppSpacing.sm),
               Text(
-                '此为按当前单价补算的估算值(这份报价单创建时还没记价格)。',
+                tr('novel_drama.estimate_note_legacy'),
                 style: AppTextStyles.labelSmall
                     .copyWith(color: AppColors.warning),
               ),
             ],
             const SizedBox(height: AppSpacing.md),
             Text(
-              '确认这份报价单后,AI 才开始生成角色设定与逐集剧本;驳回则不产生任何生成费用。',
+              tr('novel_drama.confirm_note'),
               style: AppTextStyles.bodySmall
                   .copyWith(color: AppColors.textSecondary),
             ),
           ] else
-            Text('报价数据加载中…',
+            Text(tr('novel_drama.quote_loading'),
                 style: AppTextStyles.bodySmall
                     .copyWith(color: AppColors.textTertiary)),
+        ],
+      ),
+    );
+  }
+
+  /// 报价门里的「分集时长计划」:罗列后端按原著逐集折算出的集数与每集时长。
+  /// `_plan` 为空(没建账本 / 拉取失败)时返回 0 高,不影响报价卡其余部分。
+  Widget _buildEpisodePlan() {
+    final eps =
+        (_plan?['episodes'] as List?)?.whereType<Map>().toList() ??
+            const <Map>[];
+    if (eps.isEmpty) return const SizedBox.shrink();
+    final count = _asInt(_plan?['episodeCount']) ?? eps.length;
+    final genSec = _asInt(_plan?['totalGenSec']) ?? 0;
+    final minSec = _asInt(_plan?['minSec']) ?? 45;
+    final maxSec = _asInt(_plan?['maxSec']) ?? 240;
+    final minLabel = tr('novel_drama.minutes_unit',
+        args: {'n': (genSec / 60).toStringAsFixed(genSec >= 600 ? 0 : 1)});
+    const maxShow = 8;
+    final shown = eps.take(maxShow).toList();
+
+    return Container(
+      margin: const EdgeInsets.only(top: AppSpacing.md),
+      padding: const EdgeInsets.all(AppSpacing.md),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceLight,
+        borderRadius: BorderRadius.circular(AppColors.slotRadius),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.schedule_rounded, color: AppColors.primary, size: 16),
+              const SizedBox(width: AppSpacing.xs),
+              Expanded(
+                child: Text(
+                  tr('novel_drama.plan_summary',
+                      args: {'eps': '$count', 'min': minLabel}),
+                  style: AppTextStyles.labelSmall.copyWith(
+                      color: AppColors.textSecondary,
+                      fontWeight: FontWeight.w700),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: AppSpacing.xxs),
+          Text(
+            tr('novel_drama.plan_note',
+                args: {'min_sec': '$minSec', 'max_sec': '$maxSec'}),
+            style: AppTextStyles.labelSmall
+                .copyWith(color: AppColors.textTertiary, height: 1.4),
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          ...shown.map((e) {
+            final n = _asInt(e['epNo']) ?? 0;
+            final content = _asInt(e['contentSec']) ?? 0;
+            final gen = _asInt(e['genTargetSec']) ?? 0;
+            final shots = _asInt(e['plannedShots']) ?? 0;
+            final raised = e['raised'] == true;
+            final capped = e['capped'] == true;
+            return Padding(
+              padding: const EdgeInsets.only(bottom: AppSpacing.xxs),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 46,
+                    child: Text(tr('novel_drama.plan_ep', args: {'n': '$n'}),
+                        style: AppTextStyles.labelSmall.copyWith(
+                            color: AppColors.textSecondary,
+                            fontWeight: FontWeight.w600)),
+                  ),
+                  Expanded(
+                    child: Text(
+                      tr('novel_drama.plan_ep_line',
+                          args: {'content': '$content', 'gen': '$gen', 'shots': '$shots'}),
+                      style: AppTextStyles.labelSmall
+                          .copyWith(color: AppColors.textSecondary),
+                    ),
+                  ),
+                  if (raised || capped)
+                    Text(
+                      raised
+                          ? tr('novel_drama.plan_raised')
+                          : tr('novel_drama.plan_capped'),
+                      style: AppTextStyles.labelSmall.copyWith(
+                          fontSize: 10,
+                          color: raised ? AppColors.warning : AppColors.accent),
+                    ),
+                ],
+              ),
+            );
+          }),
+          if (eps.length > shown.length)
+            Text(
+              tr('novel_drama.plan_more_eps',
+                  args: {'n': '${eps.length - shown.length}'}),
+              style: AppTextStyles.labelSmall
+                  .copyWith(color: AppColors.textTertiary),
+            ),
         ],
       ),
     );
@@ -2035,7 +2172,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               Icon(Icons.account_tree_rounded,
                   color: AppColors.primary, size: 20),
               const SizedBox(width: AppSpacing.sm),
-              Flexible(child: Text('生产管线状态', style: AppTextStyles.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis)),
+              Flexible(child: Text(tr('novel_drama.pipeline_title'), style: AppTextStyles.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis)),
             ],
           ),
           const SizedBox(height: AppSpacing.md),
@@ -2043,9 +2180,9 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             final gate = g['gate']?.toString() ?? '';
             final status = g['status']?.toString() ?? 'waiting';
             final label = switch (gate) {
-              'gate1_budget' => '① 报价确认',
-              'gate2_design' => '② 设定(角色/场景/画风)',
-              'gate3_script' => '③ 剧本(逐集分镜)',
+              'gate1_budget' => tr('novel_drama.pipeline_gate1'),
+              'gate2_design' => tr('novel_drama.pipeline_gate2'),
+              'gate3_script' => tr('novel_drama.pipeline_gate3'),
               _ => gate,
             };
             return Padding(
@@ -2063,7 +2200,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           }),
           const SizedBox(height: AppSpacing.sm),
           Text(
-            '审批门驱动流水线:①报价确认后自动生成设定 → ②设定确认后逐集生成剧本 → ③剧本确认后进入连集生产(分镜/关键帧/视频/成片),全程不通过不烧钱。',
+            tr('novel_drama.pipeline_desc'),
             style: AppTextStyles.labelSmall
                 .copyWith(color: AppColors.textTertiary),
           ),
@@ -2076,6 +2213,13 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     final gate1 = _gateOf('gate1_budget');
     final g1 = gate1?['status']?.toString();
     final waiting = g1 == 'waiting';
+    // 后台 beats 抽取/按节拍重排进行中:后端会对 decide 抛 409(见
+    // novel-ledger.service.ts 的 repacking 分支)。与其让用户转圈→吃报错→再点,
+    // 不如直接禁用双钮 + 给真实等待时长;轮询(_stageActive)会在标志清除后自动恢复。
+    final g1Payload = _gatePayload('gate1_budget');
+    final repacking = g1Payload?['repacking'] == true;
+    final repackWaitedMin =
+        repacking ? _minutesSince(g1Payload?['repackingAt']) : null;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -2088,15 +2232,24 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           const SizedBox(height: AppSpacing.md),
         ],
         if (waiting) ...[
+          if (repacking) ...[
+            _stageHint(
+              Icons.autorenew_rounded,
+              AppColors.warning,
+              tr('novel_drama.repacking_hint',
+                  args: {'waited': '${repackWaitedMin ?? 0}'}),
+            ),
+            const SizedBox(height: AppSpacing.md),
+          ],
           Row(
             children: [
               Expanded(
                 child: WbSubmitButton(
-                  label: '驳回报价',
-                  loadingLabel: '提交中…',
+                  label: tr('novel_drama.reject_quote'),
+                  loadingLabel: tr('novel_drama.submitting'),
                   icon: Icons.close_rounded,
                   loading: _deciding,
-                  disabled: _deciding,
+                  disabled: _deciding || repacking,
                   onTap: () => _decideGate('gate1_budget', false),
                 ),
               ),
@@ -2104,11 +2257,11 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               Expanded(
                 flex: 2,
                 child: WbSubmitButton(
-                  label: '确认报价,开始生产',
-                  loadingLabel: '提交中…',
+                  label: tr('novel_drama.confirm_quote_btn'),
+                  loadingLabel: tr('novel_drama.submitting'),
                   icon: Icons.check_rounded,
                   loading: _deciding,
-                  disabled: _deciding,
+                  disabled: _deciding || repacking,
                   onTap: () => _decideGate('gate1_budget', true),
                 ),
               ),
@@ -2117,7 +2270,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         ] else if (g1 == 'rejected') ...[
           // AppColors.danger 非 const,不能包 const
           _rejectedBlock('gate1_budget',
-              '报价已驳回,未产生任何生成费用。可重新打开此门后再确认,或返回调整单集时长。'),
+              tr('novel_drama.quote_rejected_note')),
         ] else ...[
           // 门①已过 → Stage 2 流水线:设定门 → 剧本门 → 连集生产
           _buildGate2Card(),
@@ -2138,16 +2291,16 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     final List<Widget> body = [];
     if (status == 'passed') {
       body.add(_stageHint(Icons.check_circle_outline_rounded, AppColors.success,
-          '设定已通过${_asInt(p?['createdCount']) != null ? ' · 新建资产 ${p?['createdCount']} 项' : ''},逐集剧本阶段继续'));
+          tr('novel_drama.settings_passed', args: {'detail': _asInt(p?['createdCount']) != null ? tr('novel_drama.assets_created_suffix', args: {'n': "${p?['createdCount']}"}) : ''})));
       if (state == 'ready') body.add(_assetSummary(p!));
       // 自动定妆正是在这一步之后才跑,进度必须显示在同一张卡片上
       body.add(const SizedBox(height: AppSpacing.md));
       body.add(_portraitNotice());
     } else if (status == 'rejected') {
       body.add(_rejectedBlock('gate2_design',
-          '设定已驳回,未进入剧本生成。可重新打开此门后重试生成设定,或直接确认当前设定。'));
+          tr('novel_drama.design_rejected_note')));
     } else if (state == 'generating') {
-      body.add(_stageSpinner('AI 正在生成角色 / 场景 / 画风设定…(约 1-2 分钟)'));
+      body.add(_stageSpinner(tr('novel_drama.design_running')));
       body.add(const SizedBox(height: AppSpacing.md));
       body.add(_stageEscapeHatch('gate2_design', g));
     } else if (state == 'ready') {
@@ -2159,7 +2312,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         children: [
           Expanded(
             child: _GateMiniButton(
-              label: '驳回',
+              label: tr('novel_drama.reject_btn'),
               icon: Icons.close_rounded,
               color: AppColors.danger,
               busy: _deciding,
@@ -2170,8 +2323,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           Expanded(
             flex: 2,
             child: WbSubmitButton(
-              label: '确认设定,生成剧本',
-              loadingLabel: '提交中…',
+              label: tr('novel_drama.confirm_design_btn'),
+              loadingLabel: tr('novel_drama.submitting'),
               icon: Icons.check_rounded,
               loading: _deciding,
               disabled: _deciding,
@@ -2182,11 +2335,11 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       ));
     } else if (state == 'failed') {
       body.add(_stageHint(Icons.error_outline_rounded, AppColors.danger,
-          '设定生成失败:${p?['error'] ?? '未知原因'}'));
+          tr('novel_drama.design_failed', args: {'reason': '${p?['error'] ?? tr('novel_drama.unknown_reason')}'})));
       body.add(const SizedBox(height: AppSpacing.md));
       body.add(WbSubmitButton(
-        label: '重试生成设定',
-        loadingLabel: '拉起中…',
+        label: tr('novel_drama.retry_design_btn'),
+        loadingLabel: tr('novel_drama.pulling_up'),
         icon: Icons.refresh_rounded,
         loading: _deciding,
         disabled: _deciding,
@@ -2194,10 +2347,10 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       ));
     } else {
       body.add(_stageHint(Icons.hourglass_top_rounded, AppColors.warning,
-          '已排队,AI 正在拉起设定生成…'));
+          tr('novel_drama.queued_design')));
       body.add(const SizedBox(height: AppSpacing.md));
       body.add(_GateMiniButton(
-        label: '长时间无响应?点此重新拉起',
+        label: tr('novel_drama.toast_unresponsive_btn'),
         icon: Icons.refresh_rounded,
         color: AppColors.textSecondary,
         busy: _deciding,
@@ -2206,7 +2359,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     }
     return _stageCard(
       icon: Icons.palette_outlined,
-      title: '审批门 ② 设定(角色/场景/画风)',
+      title: tr('novel_drama.gate2_title'),
       gateStatus: status,
       body: body,
     );
@@ -2225,16 +2378,16 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       body.add(_buildProductionCard(p));
     } else if (status == 'rejected') {
       body.add(_rejectedBlock('gate3_script',
-          '剧本已驳回,未进入成片生产。可重新打开此门后确认剧本,或重试生成剧本再决策。'));
+          tr('novel_drama.script_rejected_note')));
     } else if (!gate2Passed) {
       body.add(_stageHint(Icons.lock_outline_rounded, AppColors.textTertiary,
-          '门②设定通过后,自动逐集生成剧本(承接大纲)'));
+          tr('novel_drama.gate2_desc')));
     } else if (state == 'generating') {
       final done = _asInt(p?['episodesDone']) ?? 0;
       final total = _asInt(p?['episodesTotal']) ?? 0;
       body.add(_stageSpinner(total > 0
-          ? 'AI 正在逐集写承接大纲… 第 $done/$total 集'
-          : 'AI 正在逐集写承接大纲…'));
+          ? tr('novel_drama.script_running', args: {'done': '$done', 'total': '$total'})
+          : tr('novel_drama.script_running_plain')));
       if (total > 0) {
         body.addAll([
           const SizedBox(height: AppSpacing.md),
@@ -2258,7 +2411,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         children: [
           Expanded(
             child: _GateMiniButton(
-              label: '驳回',
+              label: tr('novel_drama.reject_btn'),
               icon: Icons.close_rounded,
               color: AppColors.danger,
               busy: _deciding,
@@ -2269,8 +2422,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           Expanded(
             flex: 2,
             child: WbSubmitButton(
-              label: '确认剧本,开始生产',
-              loadingLabel: '提交中…',
+              label: tr('novel_drama.confirm_script_btn'),
+              loadingLabel: tr('novel_drama.submitting'),
               icon: Icons.movie_filter_outlined,
               loading: _deciding,
               disabled: _deciding,
@@ -2281,11 +2434,11 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       ));
     } else if (state == 'failed') {
       body.add(_stageHint(Icons.error_outline_rounded, AppColors.danger,
-          '阶段失败:${p?['error'] ?? '未知原因'}'));
+          tr('novel_drama.stage_failed', args: {'reason': '${p?['error'] ?? tr('novel_drama.unknown_reason')}'})));
       body.add(const SizedBox(height: AppSpacing.md));
       body.add(WbSubmitButton(
-        label: '重试本阶段',
-        loadingLabel: '拉起中…',
+        label: tr('novel_drama.retry_stage_btn'),
+        loadingLabel: tr('novel_drama.pulling_up'),
         icon: Icons.refresh_rounded,
         loading: _deciding,
         disabled: _deciding,
@@ -2293,10 +2446,10 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       ));
     } else {
       body.add(_stageHint(Icons.hourglass_top_rounded, AppColors.warning,
-          '已排队,AI 正在拉起剧本生成…'));
+          tr('novel_drama.queued_script')));
       body.add(const SizedBox(height: AppSpacing.md));
       body.add(_GateMiniButton(
-        label: '长时间无响应?点此重新拉起',
+        label: tr('novel_drama.toast_unresponsive_btn'),
         icon: Icons.refresh_rounded,
         color: AppColors.textSecondary,
         busy: _deciding,
@@ -2305,9 +2458,473 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     }
     return _stageCard(
       icon: Icons.movie_outlined,
-      title: '审批门 ③ 剧本(逐集分镜)与成片生产',
+      title: tr('novel_drama.gate3_title'),
       gateStatus: status,
       body: body,
+    );
+  }
+
+  // ── 连集分集与分镜明细(2026-09-20 优化:可观察、可修改、可补做) ──────────
+
+  Future<void> _loadEpisodes() async {
+    final uuid = _dramaUuid;
+    if (uuid == null) return;
+    if (mounted) setState(() => _episodesLoading = true);
+    try {
+      final r = await _api.dio.get('/dramas/$uuid/episodes', options: _fresh);
+      final list = (_unwrap(r) as List?)?.whereType<Map>().toList() ?? const [];
+      if (mounted) {
+        setState(() {
+          _episodes = list.map((e) => Map<String, dynamic>.from(e)).toList();
+        });
+      }
+    } catch (_) {
+    } finally {
+      if (mounted) setState(() => _episodesLoading = false);
+    }
+  }
+
+  /// 补做指定集的缺失镜头:重跑步骤 4 (自动复用成功镜头,只补做失败/未生成镜) + 步骤 5 重合成
+  Future<void> _supplementEpShots(int epNo) async {
+    final uuid = _dramaUuid;
+    if (uuid == null) return;
+    setState(() => _supplementingEp = epNo);
+    _toast('正在补做第 $epNo 集缺失镜头并重合成，请稍候…');
+    try {
+      // 步骤 4 视频增量补做
+      await _api.dio.post(
+        '/dramas/$uuid/episodes/$epNo/steps/4/generate',
+        data: const {},
+        options: Options(receiveTimeout: const Duration(minutes: 20)),
+      );
+      // 步骤 5 重新合成成片
+      await _api.dio.post(
+        '/dramas/$uuid/episodes/$epNo/steps/5/generate',
+        data: const {},
+        options: Options(receiveTimeout: const Duration(minutes: 10)),
+      );
+      _toast('第 $epNo 集缺失镜头补做完成，成片已更新！');
+      await _loadEpisodes();
+    } catch (e) {
+      if (mounted) _toast('补做失败: ${_errMsg(e)}', error: true);
+    } finally {
+      if (mounted) setState(() => _supplementingEp = null);
+    }
+  }
+
+  /// 弹窗修改指定集字幕台词并 5 秒快速重烧(不重新生成视频,不耗视频配额)
+  Future<void> _openReburnDialog(Map<String, dynamic> ep) async {
+    final epNo = (ep['epNo'] as num?)?.toInt() ?? 1;
+    final sd = (ep['stepData'] as Map?)?.cast<String, dynamic>() ?? const {};
+    final out5 = (sd['5'] as Map?)?['output'] as Map?;
+    final out2 = (sd['2'] as Map?)?['output'] as Map?;
+    final subtitleCues = (out5?['subtitle_cues'] as List?)?.whereType<Map>().toList() ?? const [];
+    final shots = (out2?['shots'] as List?)?.whereType<Map>().toList() ?? const [];
+
+    final items = <Map<String, dynamic>>[];
+    if (subtitleCues.isNotEmpty) {
+      for (final c in subtitleCues) {
+        items.add({
+          'shotIdx': (c['shotIdx'] as num?)?.toInt() ?? 0,
+          'text': (c['text'] ?? '').toString(),
+          'speaker': c['speaker'],
+        });
+      }
+    } else {
+      for (final s in shots) {
+        items.add({
+          'shotIdx': (s['idx'] as num?)?.toInt() ?? 0,
+          'text': (s['dialogue'] ?? '').toString(),
+          'speaker': null,
+        });
+      }
+    }
+
+    if (items.isEmpty) {
+      _toast('本集暂无台词可微调', error: true);
+      return;
+    }
+
+    final controllers = items.map((it) => TextEditingController(text: it['text'] as String)).toList();
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.subtitles_outlined, color: AppColors.primary, size: 20),
+            const SizedBox(width: AppSpacing.sm),
+            Text('微调第 $epNo 集字幕台词', style: AppTextStyles.titleSmall),
+          ],
+        ),
+        content: SizedBox(
+          width: 500,
+          height: 380,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '修改后点击「立即重烧」，系统将直接复用视频在 5 秒内烧录新字幕，零视频配额消耗。',
+                style: AppTextStyles.caption.copyWith(color: AppColors.textSecondary),
+              ),
+              const SizedBox(height: AppSpacing.md),
+              Expanded(
+                child: ListView.separated(
+                  itemCount: items.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: AppSpacing.sm),
+                  itemBuilder: (context, idx) {
+                    final it = items[idx];
+                    return Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: AppColors.surfaceLight,
+                            borderRadius: BorderRadius.circular(AppRadius.bar),
+                          ),
+                          child: Text('镜 ${it['shotIdx']}', style: AppTextStyles.labelSmall),
+                        ),
+                        const SizedBox(width: AppSpacing.sm),
+                        Expanded(
+                          child: TextField(
+                            controller: controllers[idx],
+                            maxLines: 2,
+                            minLines: 1,
+                            style: AppTextStyles.bodySmall,
+                            decoration: InputDecoration(
+                              isDense: true,
+                              contentPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+                              border: OutlineInputBorder(borderRadius: BorderRadius.circular(AppColors.buttonRadius)),
+                            ),
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(tr('common.cancel'))),
+          FilledButton.icon(
+            onPressed: () => Navigator.pop(ctx, true),
+            icon: const Icon(Icons.bolt_rounded, size: 16),
+            label: const Text('立即重烧字幕 (5秒)'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) {
+      for (final c in controllers) {
+        c.dispose();
+      }
+      return;
+    }
+
+    final edits = <Map<String, dynamic>>[];
+    for (var i = 0; i < items.length; i++) {
+      final newText = controllers[i].text.trim();
+      edits.add({
+        'shotIdx': items[i]['shotIdx'],
+        'text': newText,
+        'speaker': items[i]['speaker'],
+      });
+      controllers[i].dispose();
+    }
+
+    setState(() => _reburningEp = epNo);
+    _toast('正在重烧第 $epNo 集字幕…');
+    try {
+      final resp = await _api.dio.post(
+        '/dramas/$_dramaUuid/episodes/$epNo/subtitles/reburn',
+        data: {'edits': edits},
+        options: Options(receiveTimeout: const Duration(minutes: 5)),
+      );
+      final data = _unwrap(resp);
+      _toast(data is Map && data['needsRealign'] == true
+          ? '字幕已重烧进成片；字数变化超阈值，精确对齐需重跑分镜'
+          : '第 $epNo 集字幕已成功重烧！');
+      await _loadEpisodes();
+    } catch (e) {
+      if (mounted) _toast('重烧失败: ${_errMsg(e)}', error: true);
+    } finally {
+      if (mounted) setState(() => _reburningEp = null);
+    }
+  }
+
+  /// 各集分镜制作明细与操作面板
+  Widget _buildEpisodesBreakdown() {
+    if (_episodes.isEmpty) {
+      if (_episodesLoading) {
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 14, height: 14,
+                child: CircularProgressIndicator(strokeWidth: 1.8, color: AppColors.primary),
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              Text('正在读取各集制作明细…', style: AppTextStyles.caption.copyWith(color: AppColors.textTertiary)),
+            ],
+          ),
+        );
+      }
+      return const SizedBox.shrink();
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.video_library_outlined, size: 16, color: AppColors.primary),
+            const SizedBox(width: AppSpacing.sm),
+            Text(
+              '各集分镜明细与操作 (${_episodes.length} 集)',
+              style: AppTextStyles.labelSmall.copyWith(color: AppColors.textSecondary, fontWeight: FontWeight.w700),
+            ),
+            const Spacer(),
+            TextButton.icon(
+              onPressed: () => setState(() => _episodesExpanded = !_episodesExpanded),
+              icon: Icon(_episodesExpanded ? Icons.expand_less_rounded : Icons.expand_more_rounded, size: 16),
+              label: Text(_episodesExpanded ? '收起' : '展开明细', style: AppTextStyles.caption),
+            ),
+          ],
+        ),
+        if (_episodesExpanded) ...[
+          const SizedBox(height: AppSpacing.xs),
+          for (final ep in _episodes) _buildEpisodeItemCard(ep),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildEpisodeItemCard(Map<String, dynamic> ep) {
+    final epNo = (ep['epNo'] as num?)?.toInt() ?? 1;
+    final title = ep['title']?.toString() ?? '第 $epNo 集';
+    final sd = (ep['stepData'] as Map?)?.cast<String, dynamic>() ?? const {};
+    final out5 = (sd['5'] as Map?)?['output'] as Map?;
+    final out2 = (sd['2'] as Map?)?['output'] as Map?;
+    final out3 = (sd['3'] as Map?)?['output'] as Map?;
+    final out4 = (sd['4'] as Map?)?['output'] as Map?;
+
+    final finalUrl = (ep['finalUrl'] ?? out5?['final_url'] ?? '').toString();
+    final durationSec = (out5?['duration_sec'] as num?)?.toDouble() ?? 0.0;
+    final shotCount = (out5?['shot_count'] as num?)?.toInt() ?? 0;
+    final missingShots = (out5?['missing_shots'] as num?)?.toInt() ?? 0;
+
+    final shotsList = (out2?['shots'] as List?)?.whereType<Map>().toList() ?? const [];
+    final keyframesList = (out3?['keyframes'] as List?)?.whereType<Map>().toList() ?? const [];
+    final kfMap = <int, String>{};
+    for (final k in keyframesList) {
+      if (k['url'] != null) kfMap[(k['shot_idx'] as num?)?.toInt() ?? 0] = k['url'].toString();
+    }
+    final videoShotsList = (out4?['shots'] as List?)?.whereType<Map>().toList() ?? const [];
+    final videoMap = <int, Map<String, dynamic>>{};
+    for (final v in videoShotsList) {
+      if (v['shot_idx'] != null) videoMap[(v['shot_idx'] as num?)?.toInt() ?? 0] = Map<String, dynamic>.from(v);
+    }
+
+    final isExpanded = _expandedEpNo == epNo;
+    final isSupplementing = _supplementingEp == epNo;
+    final isReburning = _reburningEp == epNo;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: AppSpacing.sm),
+      padding: const EdgeInsets.all(AppSpacing.md),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceLight,
+        borderRadius: BorderRadius.circular(AppColors.slotRadius),
+        border: Border.all(
+          color: missingShots > 0
+              ? AppColors.danger.withValues(alpha: 0.3)
+              : AppColors.border.withValues(alpha: 0.5),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: AppColors.primary.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(AppRadius.bar),
+                ),
+                child: Text('EP$epNo', style: AppTextStyles.labelSmall.copyWith(color: AppColors.primary, fontWeight: FontWeight.w800)),
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(
+                child: Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: AppTextStyles.bodySmall.copyWith(fontWeight: FontWeight.w700),
+                ),
+              ),
+              if (durationSec > 0)
+                Text(
+                  '${durationSec.toStringAsFixed(0)}秒 · $shotCount镜',
+                  style: AppTextStyles.caption.copyWith(color: AppColors.textSecondary),
+                ),
+              if (missingShots > 0) ...[
+                const SizedBox(width: AppSpacing.sm),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: AppColors.danger.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(AppRadius.bar),
+                  ),
+                  child: Text('缺 $missingShots 镜', style: AppTextStyles.caption.copyWith(color: AppColors.danger, fontWeight: FontWeight.w700)),
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          // 操作按钮行
+          Row(
+            children: [
+              if (missingShots > 0)
+                _GateMiniButton(
+                  label: isSupplementing ? '正在补做…' : '补做缺失镜头',
+                  icon: Icons.auto_fix_high_rounded,
+                  color: AppColors.danger,
+                  busy: isSupplementing,
+                  onTap: () => _supplementEpShots(epNo),
+                ),
+              if (finalUrl.isNotEmpty) ...[
+                if (missingShots > 0) const SizedBox(width: AppSpacing.sm),
+                _GateMiniButton(
+                  label: isReburning ? '重烧中…' : '微调台词',
+                  icon: Icons.subtitles_outlined,
+                  color: AppColors.primary,
+                  busy: isReburning,
+                  onTap: () => _openReburnDialog(ep),
+                ),
+                const SizedBox(width: AppSpacing.sm),
+                _GateMiniButton(
+                  label: '播放本集',
+                  icon: Icons.play_arrow_rounded,
+                  color: AppColors.success,
+                  onTap: () => webOpenInNewTab(Uri.parse(ApiClient.resolveUrl(finalUrl))),
+                ),
+              ],
+              const Spacer(),
+              if (shotsList.isNotEmpty)
+                TextButton.icon(
+                  onPressed: () => setState(() => _expandedEpNo = isExpanded ? null : epNo),
+                  icon: Icon(isExpanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down, size: 16),
+                  label: Text(isExpanded ? '收起分镜' : '看分镜(${shotsList.length})', style: AppTextStyles.caption),
+                ),
+            ],
+          ),
+          // 展开分镜列表九宫格/卡片
+          if (isExpanded && shotsList.isNotEmpty) ...[
+            const Divider(height: AppSpacing.lg),
+            for (final shot in shotsList) ...[
+              _buildShotDetailRow(
+                shot: Map<String, dynamic>.from(shot),
+                kfUrl: kfMap[(shot['idx'] as num?)?.toInt() ?? 0],
+                videoInfo: videoMap[(shot['idx'] as num?)?.toInt() ?? 0],
+              ),
+              const SizedBox(height: AppSpacing.sm),
+            ],
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildShotDetailRow({
+    required Map<String, dynamic> shot,
+    String? kfUrl,
+    Map<String, dynamic>? videoInfo,
+  }) {
+    final idx = (shot['idx'] as num?)?.toInt() ?? 0;
+    final shotType = (shot['shot_type'] ?? '中景').toString();
+    final duration = (shot['duration_sec'] ?? 10).toString();
+    final dialogue = (shot['dialogue'] ?? '').toString();
+    final description = (shot['description'] ?? '').toString();
+    final videoStatus = videoInfo?['status']?.toString();
+    final isVideoOk = videoStatus == 'completed';
+    final isVideoFailed = videoStatus == 'failed';
+
+    return Container(
+      padding: const EdgeInsets.all(AppSpacing.sm),
+      decoration: BoxDecoration(
+        color: AppColors.cardBg,
+        borderRadius: BorderRadius.circular(AppColors.buttonRadius),
+        border: Border.all(
+          color: isVideoFailed
+              ? AppColors.danger.withValues(alpha: 0.3)
+              : AppColors.border.withValues(alpha: 0.4),
+        ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // 关键帧缩略图
+          ClipRRect(
+            borderRadius: BorderRadius.circular(AppRadius.bar),
+            child: Container(
+              width: 54, height: 72,
+              color: AppColors.surfaceLight,
+              child: kfUrl != null && kfUrl.isNotEmpty
+                  ? Image.network(
+                      ApiClient.resolveUrl(kfUrl),
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => Center(
+                        child: Icon(Icons.broken_image_outlined, size: 18, color: AppColors.textTertiary),
+                      ),
+                    )
+                  : Center(
+                      child: Icon(Icons.image_outlined, size: 18, color: AppColors.textTertiary),
+                    ),
+            ),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text('镜 $idx · $shotType · ${duration}s',
+                        style: AppTextStyles.labelSmall.copyWith(fontWeight: FontWeight.w700)),
+                    const Spacer(),
+                    if (isVideoOk)
+                      Icon(Icons.check_circle, size: 14, color: AppColors.success)
+                    else if (isVideoFailed)
+                      Text('生成失败', style: AppTextStyles.caption.copyWith(color: AppColors.danger, fontWeight: FontWeight.w700))
+                    else
+                      Text('待处理', style: AppTextStyles.caption.copyWith(color: AppColors.textTertiary)),
+                  ],
+                ),
+                if (dialogue.isNotEmpty) ...[
+                  const SizedBox(height: AppSpacing.xxs),
+                  Text('台词: $dialogue',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: AppTextStyles.caption.copyWith(color: AppColors.primary, fontWeight: FontWeight.w600)),
+                ],
+                if (description.isNotEmpty) ...[
+                  const SizedBox(height: AppSpacing.xxs),
+                  Text('画面: $description',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: AppTextStyles.caption.copyWith(color: AppColors.textTertiary)),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -2338,11 +2955,11 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         status != 'cancelled';
 
     final (Color color, String title) = switch (status) {
-      'done' => (AppColors.success, '全部完成 🎉 $toEp 集成片已产出'),
-      'paused' => (AppColors.warning, '生产暂停(多为预算耗尽)——可到剧集详情提高预算续跑'),
+      'done' => (AppColors.success, tr('novel_drama.batch_done_title', args: {'n': '$toEp'})),
+      'paused' => (AppColors.warning, tr('novel_drama.batch_paused_title')),
       'failed' => (AppColors.danger,
-          '生产失败:${(b?['error'] ?? p?['batchError'] ?? '见剧集详情').toString()}'),
-      'cancelled' => (AppColors.textTertiary, '生产已取消'),
+          tr('novel_drama.batch_failed', args: {'reason': (b?['error'] ?? p?['batchError'] ?? tr('novel_drama.see_drama_detail')).toString()})),
+      'cancelled' => (AppColors.textTertiary, tr('novel_drama.batch_cancelled_title')),
       _ => (AppColors.primary,
           '连集生产中:EP$curEp/$toEp · ${stepLabel.isNotEmpty ? stepLabel : (curStep >= 0 && curStep < 6 ? stepLabels[curStep] : '')}'),
     };
@@ -2392,7 +3009,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             child: ExpansionTile(
               tilePadding: EdgeInsets.zero,
               childrenPadding: const EdgeInsets.only(bottom: AppSpacing.sm),
-              title: Text('全时间线(${logs.length}条 · 含失败原因与逐步积分)',
+              title: Text(tr('novel_drama.timeline_title', args: {'n': '${logs.length}'}),
                   style: AppTextStyles.labelSmall.copyWith(color: AppColors.textSecondary)),
               children: [
                 ...logs.reversed.map((l) {
@@ -2410,9 +3027,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                         const SizedBox(width: AppSpacing.sm),
                         Expanded(
                           child: Text(
-                            'EP${l['ep']} 第${(_asInt(l['step']) ?? 0) + 1}步 · ${l['msg'] ?? ''}'
-                            '${credits > 0 ? ' · $credits 分' : ''}'
-                            '${hhmm.isNotEmpty ? ' · $hhmm' : ''}',
+                            '${tr('novel_drama.timeline_entry', args: {'ep': '${l['ep']}', 'step': '${(_asInt(l['step']) ?? 0) + 1}', 'msg': '${l['msg'] ?? ''}'})}${credits > 0 ? tr('novel_drama.credits_unit', args: {'n': '$credits'}) : ''}${hhmm.isNotEmpty ? ' · $hhmm' : ''}',
                             style: AppTextStyles.labelSmall.copyWith(
                                 fontSize: 10,
                                 color: ok ? AppColors.textSecondary : AppColors.danger),
@@ -2429,13 +3044,12 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         if (looksStuck) ...[
           const SizedBox(height: AppSpacing.md),
           Text(
-            '已经 $staleMins 分钟没有新进展 · 批次执行者活在后端进程内存里,'
-            '进程重启后 DB 仍是「生产中」但不会再动,可在此重新入队续跑',
+            tr('novel_drama.batch_stale_note', args: {'n': '$staleMins'}),
             style: AppTextStyles.labelSmall.copyWith(color: AppColors.warning),
           ),
           const SizedBox(height: AppSpacing.sm),
           _GateMiniButton(
-            label: '长时间无响应?点此从断点续跑',
+            label: tr('novel_drama.toast_unresponsive_resume'),
             icon: Icons.refresh_rounded,
             color: AppColors.textSecondary,
             busy: _deciding,
@@ -2445,13 +3059,15 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         if (status == 'paused' || status == 'failed') ...[
           const SizedBox(height: AppSpacing.md),
           _GateMiniButton(
-            label: status == 'paused' ? '从断点续跑' : '重试该批次',
+            label: status == 'paused' ? tr('novel_drama.resume_btn') : tr('novel_drama.retry_batch_btn'),
             icon: Icons.play_arrow_rounded,
             color: AppColors.primary,
             busy: _deciding,
             onTap: _resumeBatch,
           ),
         ],
+        const SizedBox(height: AppSpacing.md),
+        _buildEpisodesBreakdown(),
         // ── 就地控制(2026-09-15) ───────────────────────────────────────
         // 以前这四个动作散在剧集详情页与剧集列表页,而工作台正是用户盯着进度
         // 的那一屏 —— 想暂停得先离开正在看的进度。运行中给「暂停 / 取消」,
@@ -2463,17 +3079,17 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             if (status == 'running' || status == 'queued') ...[
               Expanded(
                 child: _GateMiniButton(
-                  label: '暂停',
+                  label: tr('common.pause'),
                   icon: Icons.pause_rounded,
                   color: AppColors.warning,
                   busy: _projectBusy,
-                  onTap: () => _setBatchStatus('paused', '已暂停,可在断点续跑'),
+                  onTap: () => _setBatchStatus('paused', tr('novel_drama.toast_batch_paused')),
                 ),
               ),
               const SizedBox(width: AppSpacing.sm),
               Expanded(
                 child: _GateMiniButton(
-                  label: '取消生产',
+                  label: tr('novel_drama.cancel_production'),
                   icon: Icons.stop_rounded,
                   color: AppColors.danger,
                   busy: _projectBusy,
@@ -2484,7 +3100,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             ],
             Expanded(
               child: _GateMiniButton(
-                label: _playing ? '打开中…' : '看成片',
+                label: _playing ? tr('novel_drama.opening') : tr('novel_drama.view_film_btn'),
                 icon: Icons.play_circle_outline_rounded,
                 color: AppColors.success,
                 busy: _playing,
@@ -2499,7 +3115,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             Expanded(
               flex: 2,
               child: WbSubmitButton(
-                label: '打开剧集详情(逐集进度 / 分镜 / 关键帧)',
+                label: tr('novel_drama.open_drama_detail'),
                 icon: Icons.open_in_new_rounded,
                 onTap: _openDramaDetail,
               ),
@@ -2507,7 +3123,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             const SizedBox(width: AppSpacing.sm),
             Expanded(
               child: _GateMiniButton(
-                label: '删除项目',
+                label: tr('novel_drama.delete_project'),
                 icon: Icons.delete_outline_rounded,
                 color: AppColors.danger,
                 busy: _projectBusy,
@@ -2525,24 +3141,23 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('取消生产'),
-        content: const Text('取消后这一批不会再继续,已经生成的集与成片会保留,'
-            '但不会自动补做剩下的集。\n\n之后仍可从这里「从断点续跑」恢复。'),
+        title: Text(tr('novel_drama.cancel_production')),
+        content: Text(tr('novel_drama.dialog_cancel_body')),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('再想想'),
+            child: Text(tr('novel_drama.think_again')),
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
             style: TextButton.styleFrom(foregroundColor: AppColors.danger),
-            child: const Text('取消生产'),
+            child: Text(tr('novel_drama.cancel_production')),
           ),
         ],
       ),
     );
     if (ok != true) return;
-    await _setBatchStatus('cancelled', '已取消生产');
+    await _setBatchStatus('cancelled', tr('novel_drama.toast_batch_cancelled'));
   }
 
   // ── 阶段卡片小组件 ────────────────────────────────────────────────────
@@ -2607,14 +3222,14 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         _stageHint(Icons.block_rounded, AppColors.danger, text),
         if (note != null && note.trim().isNotEmpty) ...[
           const SizedBox(height: AppSpacing.sm),
-          Text('驳回备注:$note',
+          Text(tr('novel_drama.reject_note', args: {'note': note}),
               style: AppTextStyles.labelSmall
                   .copyWith(color: AppColors.textTertiary)),
         ],
         const SizedBox(height: AppSpacing.md),
         WbSubmitButton(
-          label: '重新打开此门',
-          loadingLabel: '提交中…',
+          label: tr('novel_drama.reopen_gate_btn'),
+          loadingLabel: tr('novel_drama.submitting'),
           icon: Icons.lock_open_rounded,
           loading: _deciding,
           disabled: _deciding,
@@ -2650,9 +3265,9 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     }
 
     final rows = <Widget>[
-      _assetRow(Icons.person_outline, '角色', names('characters')),
-      _assetRow(WorkbenchIcons.scene, '场景', names('locations')),
-      _assetRow(WorkbenchIcons.prop, '道具', names('props')),
+      _assetRow(Icons.person_outline, tr('novel_drama.asset_characters'), names('characters')),
+      _assetRow(WorkbenchIcons.scene, tr('novel_drama.asset_locations'), names('locations')),
+      _assetRow(WorkbenchIcons.prop, tr('novel_drama.asset_props'), names('props')),
     ];
     return Container(
       padding: const EdgeInsets.all(AppSpacing.md),
@@ -2709,7 +3324,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       final settled = total > 0 ? ((done + failed.length) / total) : 0.0;
       return _portraitCard(
         AppColors.primary, Icons.auto_awesome,
-        '自动定妆进行中 $done/$total 项',
+        tr('novel_drama.dressing_running', args: {'done': '$done', 'total': '$total'}),
         children: [
           const SizedBox(height: AppSpacing.sm),
           ClipRRect(
@@ -2722,13 +3337,12 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             ),
           ),
           const SizedBox(height: AppSpacing.sm),
-          Text('与逐集剧本生成并行推进,每张图约 10~40 秒。'
-              '等门③ 剧本出来时,定妆基本已就绪。',
+          Text(tr('novel_drama.dressing_note'),
               style: AppTextStyles.bodySmall
                   .copyWith(color: AppColors.textSecondary, height: 1.55)),
           const SizedBox(height: AppSpacing.md),
           _GateMiniButton(
-            label: '去资产库查看',
+            label: tr('novel_drama.goto_assets_btn'),
             icon: Icons.palette_outlined,
             color: AppColors.primary,
             onTap: _openAssetsTab,
@@ -2739,13 +3353,12 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
 
     if (!_assetsLoaded || _assets.isEmpty) {
       return _stageHint(Icons.hourglass_empty_rounded,
-          AppColors.textTertiary, '正在读取资产与定妆进度…');
+          AppColors.textTertiary, tr('novel_drama.loading_assets'));
     }
 
     if (undressed.isEmpty) {
       return _stageHint(Icons.brush_rounded, AppColors.success,
-          '定妆图已全部就绪(${_assets.length} 项资产各有可用参考图),'
-              '关键帧走图生图,主角不会跨镜换脸');
+          tr('novel_drama.dressing_ready', args: {'n': '${_assets.length}'}));
     }
 
     final names = undressed
@@ -2754,26 +3367,25 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         .toList();
     final head = names.isEmpty
         ? ''
-        : '${names.take(4).join('、')}${names.length > 4 ? ' 等' : ''} —— ';
+        : '${names.take(4).join('、')}${names.length > 4 ? tr('novel_drama.and_more') : ''} —— ';
 
     if (failed.isNotEmpty) {
       return _portraitCard(
         AppColors.danger, Icons.error_outline_rounded,
-        '${undressed.length} 项资产定妆没成功',
+        tr('novel_drama.dressing_failed', args: {'n': '${undressed.length}'}),
         children: [
           const SizedBox(height: AppSpacing.sm),
           for (final f in failed.take(4))
-            Text('· ${f['name'] ?? ''}:${f['error'] ?? '未知原因'}',
+            Text(tr('novel_drama.dressing_fail_line', args: {'name': '${f['name'] ?? ''}', 'error': '${f['error'] ?? tr('novel_drama.unknown_reason')}'}),
                 style: AppTextStyles.labelSmall
                     .copyWith(color: AppColors.danger, height: 1.5)),
           const SizedBox(height: AppSpacing.sm),
-          Text('到资产库点「一键定妆剩余 ${undressed.length} 项」只会补这些,'
-              '已成功的图不会重烧。',
+          Text(tr('novel_drama.dressing_retry_hint', args: {'n': '${undressed.length}'}),
               style: AppTextStyles.bodySmall
                   .copyWith(color: AppColors.textSecondary, height: 1.55)),
           const SizedBox(height: AppSpacing.md),
           _GateMiniButton(
-            label: '去资产库重试',
+            label: tr('novel_drama.goto_assets_retry_btn'),
             icon: Icons.refresh_rounded,
             color: AppColors.danger,
             onTap: _openAssetsTab,
@@ -2784,26 +3396,23 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
 
     return _portraitCard(
       AppColors.warning, Icons.auto_awesome,
-      '${undressed.length} 项资产待定妆',
+      tr('novel_drama.dressing_pending', args: {'n': '${undressed.length}'}),
       children: [
         const SizedBox(height: AppSpacing.sm),
-        Text('$head'
-            '点「确认设定,生成剧本」后系统会自动开始批量定妆(与剧本生成并行),'
-            '通常在你审完门③ 剧本前就全部就绪,不需要再手动逐项点。'
-            '想现在就看某一项,可以先进资产库。',
+        Text('$head${tr('novel_drama.dressing_auto_note')}',
             style: AppTextStyles.bodySmall
                 .copyWith(color: AppColors.textSecondary, height: 1.55)),
         const SizedBox(height: AppSpacing.md),
         // 竖排而不是横排 Row:这个状态没被视觉回归覆盖,窄屏下赌宽度不值当
         _GateMiniButton(
-          label: _assetsLoading ? '读取资产…' : '先去资产库看看',
+          label: _assetsLoading ? tr('novel_drama.loading_assets_short') : tr('novel_drama.goto_assets_preview'),
           icon: Icons.palette_outlined,
           color: AppColors.warning,
           busy: _assetsLoading,
           onTap: _openAssetsTab,
         ),
         const SizedBox(height: AppSpacing.sm),
-        Text('或直接点下方「确认设定,生成剧本」,定妆会自动开跑。',
+        Text(tr('novel_drama.dressing_auto_hint'),
             style: AppTextStyles.labelSmall
                 .copyWith(color: AppColors.textTertiary, height: 1.5)),
       ],
@@ -2865,7 +3474,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                   const SizedBox(width: AppSpacing.sm),
                   Expanded(
                     child: Text(
-                      '${e['title'] ?? ''} · ${e['scenes'] ?? 0} 场${(e['hookOut'] ?? '').toString().isNotEmpty ? ' · 钩子:${(e['hookOut']).toString()}' : ''}',
+                      tr('novel_drama.auto_002', args: {'title': "${e['title'] ?? ''}", 'scenes': "${e['scenes'] ?? 0}", 'hook': ((e['hookOut'] ?? '').toString().isNotEmpty ? tr('novel_drama.hook_suffix', args: {'text': (e['hookOut']).toString()}) : '')}),
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: AppTextStyles.bodySmall,
@@ -2875,10 +3484,10 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               ),
             ),
           if (eps.length > shown.length)
-            Text('… 共 ${eps.length} 集',
+            Text(tr('novel_drama.eps_total', args: {'n': '${eps.length}'}),
                 style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
           if (failed.isNotEmpty)
-            Text('${failed.length} 集大纲生成失败(生产中会自动重试):${failed.map((f) => 'EP${f['ep']}').join('、')}',
+            Text(tr('novel_drama.outline_failed', args: {'n': '${failed.length}', 'eps': failed.map((f) => 'EP${f['ep']}').join('、')}),
                 style: AppTextStyles.labelSmall.copyWith(color: AppColors.warning)),
         ],
       ),
@@ -2928,9 +3537,9 @@ class _GateStatusChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final (text, color) = switch (status) {
-      'waiting' => ('待确认', AppColors.warning),
-      'passed' => ('已通过', AppColors.success),
-      'rejected' => ('已驳回', AppColors.danger),
+      'waiting' => (tr('novel_drama.chip_waiting'), AppColors.warning),
+      'passed' => (tr('novel_drama.gate_passed'), AppColors.success),
+      'rejected' => (tr('novel_drama.chip_rejected'), AppColors.danger),
       _ => (status, AppColors.textTertiary),
     };
     return Container(

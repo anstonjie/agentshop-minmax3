@@ -214,6 +214,24 @@ describe('P1-a groupIntoChains —— 链间并行、链内顺序', () => {
     expect(chains.length).toBe(3);
     expect(Math.max(...chains.map((c) => c.length))).toBe(2);
   });
+  it('maxChainLength 限制超长链: 12 镜全相连时按默认 maxChainLength=3 切割为 4 链', () => {
+    const allShots = Array.from({ length: 12 }, (_, i) => i + 1);
+    const allPairs = allShots.slice(0, -1).map((s) => ({ from: s, to: s + 1, why: 'same-location' as const }));
+    const chains = groupIntoChains(allShots, allPairs, { maxChainLength: 3 });
+    expect(chains).toEqual([
+      [1, 2, 3],
+      [4, 5, 6],
+      [7, 8, 9],
+      [10, 11, 12],
+    ]);
+    expect(chains.flat()).toEqual(allShots);
+  });
+  it('maxChainLength=0 或 Infinity 时不限制链长', () => {
+    const shots = [1, 2, 3, 4, 5];
+    const pairs = shots.slice(0, -1).map((s) => ({ from: s, to: s + 1, why: 'shared-cast' as const }));
+    const chains = groupIntoChains(shots, pairs, { maxChainLength: 0 });
+    expect(chains).toEqual([[1, 2, 3, 4, 5]]);
+  });
 });
 
 describe('P2-a chapterGoodEndingHints —— beats→每章收尾信号', () => {

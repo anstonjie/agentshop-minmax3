@@ -371,7 +371,11 @@ export function buildTimeline(
     } else {
       const span = Math.max(0, nominal.endSec - nominal.startSec);
       const pad = span * inset;
-      const usable = Math.max(minCueSec, Math.min(span - pad * 2, span * maxRatio));
+      // 2026-09-21: 基于台词字数估算合理的展示时长(每字约0.28s + 0.8s首尾缓冲)
+      // 避免3个字"小心点"在12秒镜头中霸屏11秒, 严重伤害观感
+      const charCount = (parsed.text || '').replace(/\s+/g, '').length;
+      const speechEstSec = Math.max(minCueSec, Math.min(span * maxRatio, charCount * 0.28 + 0.8));
+      const usable = Math.max(minCueSec, Math.min(span - pad * 2, speechEstSec));
       window = { startSec: nominal.startSec + pad, endSec: nominal.startSec + pad + usable };
       source = 'estimated';
       estCount++;

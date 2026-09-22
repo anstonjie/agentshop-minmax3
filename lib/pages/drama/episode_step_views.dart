@@ -15,8 +15,10 @@ import '../../services/api_client.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_text_styles.dart';
 import '../../utils/web_download.dart';
+import '../../widgets/workbench_form.dart';
 import '../../widgets/optimized_network_image.dart';
 import '../../theme/app_dimens.dart';
+import '../../i18n/i18n.dart';
 
 /// 传给各步骤视图的上下文(状态与回调由页面注入)
 class EpisodeCtx {
@@ -112,15 +114,15 @@ List<Widget> _outline(EpisodeCtx ctx) {
 
   return [
     _Card(
-      title: '本集要接住',
+      title: tr('episode_step.outline_hook_in_title'),
       child: hookIn.isEmpty
-          ? Text('第一集,无前置钩子。',
+          ? Text(tr('episode_step.outline_no_hook'),
               style: AppTextStyles.bodySmall.copyWith(color: AppColors.textTertiary))
           : Text(hookIn, style: AppTextStyles.bodyMedium.copyWith(color: AppColors.primary)),
     ),
     if (facts.isNotEmpty || openHooks.isNotEmpty)
       _Card(
-        title: '已确立事实(${facts.length}条)· 新集不得违反',
+        title: tr('episode_step.outline_facts_title', args: {'n': '${facts.length}'}),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -130,14 +132,14 @@ List<Widget> _outline(EpisodeCtx ctx) {
                 )),
             if (openHooks.isNotEmpty) ...[
               const SizedBox(height: AppSpacing.sm),
-              Text('未解悬念:${openHooks.join(' / ')}',
+              Text(tr('episode_step.outline_open_hooks', args: {'hooks': openHooks.join(' / ')}),
                   style: AppTextStyles.labelSmall.copyWith(color: AppColors.warning)),
             ],
           ],
         ),
       ),
     _Card(
-      title: '本集补充要求(可选)',
+      title: tr('episode_step.outline_brief_title'),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -147,7 +149,7 @@ List<Widget> _outline(EpisodeCtx ctx) {
             minLines: 1,
             style: AppTextStyles.bodySmall,
             decoration: InputDecoration(
-              hintText: '例:本集把线索指向地下室,但不要让任何人死亡',
+              hintText: tr('episode_step.outline_brief_hint'),
               hintStyle: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary),
               isDense: true,
               contentPadding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
@@ -158,17 +160,16 @@ List<Widget> _outline(EpisodeCtx ctx) {
             ),
           ),
           const SizedBox(height: AppSpacing.xs),
-          Text('填了会在生成时一并喂给 LLM;不填就完全按全季故事线走。',
+          Text(tr('episode_step.outline_brief_note'),
               style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
         ],
       ),
     ),
     if (!ctx.hasOutput)
-      const _Hint('生成时会自动带上世界观、既定事实、本集使命与资产索引,'
-          '不需要你重复交代前情。')
+      _Hint(tr('episode_step.outline_prefill_hint'))
     else ...[
       _Card(
-        title: '本集剧本',
+        title: tr('episode_step.outline_script_title'),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -188,7 +189,7 @@ List<Widget> _outline(EpisodeCtx ctx) {
         ),
       ),
       _Card(
-        title: '分场(${scenes.length}场 · 约 ${out['total_estimated_sec'] ?? 0} 秒)',
+        title: tr('episode_step.outline_scenes_title', args: {'n': '${scenes.length}', 'sec': '${out['total_estimated_sec'] ?? 0}'}),
         child: Column(
           children: scenes.map<Widget>((raw) {
             final m = (raw as Map).cast<String, dynamic>();
@@ -224,43 +225,41 @@ List<Widget> _outline(EpisodeCtx ctx) {
       ),
       if ((out['hook_out'] ?? '').toString().isNotEmpty)
         _Card(
-          title: '本集留下的钩子(将成为下一集的开场)',
+          title: tr('episode_step.outline_hook_out_title'),
           child: Text('${out['hook_out']}',
               style: AppTextStyles.bodyMedium.copyWith(color: AppColors.warning)),
         ),
       // 2026-09-16(批3 透明工作台):"本集从哪来"全量可查 —— 原文锚点 + 完整提示词
       if (out['anchor'] is Map) ...[
-        _Evidence('本集原文锚点 · beats 逐字',
+        _Evidence(tr('episode_step.outline_evidence_beats'),
             (((out['anchor'] as Map)['beatsAnchor'] ?? '').toString())),
-        _Evidence('本集原文锚点 · 章节摘录',
+        _Evidence(tr('episode_step.outline_evidence_chapter'),
             (((out['anchor'] as Map)['chapterExcerpt'] ?? '').toString())),
       ],
       if (out['prompt_used'] is Map) ...[
-        _Evidence('大纲提示词 · system',
+        _Evidence(tr('episode_step.outline_evidence_prompt_system'),
             (((out['prompt_used'] as Map)['system'] ?? '').toString())),
-        _Evidence('大纲提示词 · user(本集任务/锚点/资产索引全文)',
+        _Evidence(tr('episode_step.outline_evidence_prompt_user'),
             (((out['prompt_used'] as Map)['user'] ?? '').toString())),
       ],
       _Card(
-        title: '本集声明的新资产需求(${needs.length}项)',
+        title: tr('episode_step.outline_needs_title', args: {'n': '${needs.length}'}),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             if (needs.isEmpty)
-              Text('LLM 认为本集全部复用现有资产 —— 这是正常情况,'
-                  '下一步仍会把场景引用的资产送进预检,确认复用真的成立。',
+              Text(tr('episode_step.outline_needs_empty'),
                   style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary))
             else
               Wrap(
                 spacing: 5, runSpacing: 5,
                 children: needs.map((raw) {
                   final m = (raw as Map).cast<String, dynamic>();
-                  return _Tag('${m['kind'] ?? ''} · ${m['name'] ?? ''}', AppColors.accent);
+                  return WbStatusTag(label: '${m['kind'] ?? ''} · ${m['name'] ?? ''}', color: AppColors.accent);
                 }).toList(),
               ),
             const SizedBox(height: AppSpacing.sm),
-            Text('新确立事实 ${(out['established_facts_new'] as List?)?.length ?? 0} 条 · '
-                '角色状态 ${(out['character_states'] as Map?)?.length ?? 0} 项',
+            Text(tr('episode_step.outline_state_summary', args: {'facts': '${(out['established_facts_new'] as List?)?.length ?? 0}', 'states': '${(out['character_states'] as Map?)?.length ?? 0}'}),
                 style: AppTextStyles.labelSmall.copyWith(color: AppColors.textSecondary)),
           ],
         ),
@@ -309,8 +308,7 @@ List<Map<String, dynamic>> _autoDecisions(
 List<Widget> _precheckStep(EpisodeCtx ctx) {
   final pc = ctx.precheck;
   if (pc.isEmpty) {
-    return const [_Hint('预检会把本集需要的资产与剧级资产库做匹配:精确命中直接复用,'
-        '换装走变体,相似但不确定的让你拍板,全新的才生成并回流。')];
+    return [_Hint(tr('episode_step.precheck_empty_hint'))];
   }
   final hits = (pc['hits'] as List?) ?? const [];
   final variants = (pc['variants'] as List?) ?? const [];
@@ -336,19 +334,19 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
 
   return [
     _Card(
-      title: '预检结果',
+      title: tr('episode_step.precheck_title'),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Wrap(
             spacing: 6, runSpacing: 6,
             children: [
-              _Tag('共 ${summary['total'] ?? 0} 项', AppColors.textSecondary),
-              _Tag('复用 ${hits.length}', AppColors.success),
-              if (variants.isNotEmpty) _Tag('换造型 ${variants.length}', AppColors.primary),
-              if (ambiguous.isNotEmpty) _Tag('待你拍板 ${ambiguous.length}', AppColors.warning),
-              _Tag('新增 ${news.length}', AppColors.accent),
-              if (refGaps.isNotEmpty) _Tag('待补定妆图 ${refGaps.length}', AppColors.warning),
+              WbStatusTag(label: tr('episode_step.precheck_tag_total', args: {'n': '${summary['total'] ?? 0}'}), color: AppColors.textSecondary),
+              WbStatusTag(label: tr('episode_step.precheck_tag_reuse', args: {'n': '${hits.length}'}), color: AppColors.success),
+              if (variants.isNotEmpty) WbStatusTag(label: tr('episode_step.precheck_tag_variant', args: {'n': '${variants.length}'}), color: AppColors.primary),
+              if (ambiguous.isNotEmpty) WbStatusTag(label: tr('episode_step.precheck_tag_ambiguous', args: {'n': '${ambiguous.length}'}), color: AppColors.warning),
+              WbStatusTag(label: tr('episode_step.precheck_tag_new', args: {'n': '${news.length}'}), color: AppColors.accent),
+              if (refGaps.isNotEmpty) WbStatusTag(label: tr('episode_step.precheck_tag_refgap', args: {'n': '${refGaps.length}'}), color: AppColors.warning),
             ],
           ),
           const SizedBox(height: AppSpacing.md),
@@ -359,7 +357,7 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
                 ? null
                 : () => ctx.onResolve(_autoDecisions(hits, variants, news, newsBase)),
             icon: const Icon(Icons.done_all, size: 17),
-            label: Text(used.isEmpty ? '确认本集资产清单(命中即绑定)' : '重新提交本集资产清单'),
+            label: Text(used.isEmpty ? tr('episode_step.precheck_btn_confirm') : tr('episode_step.precheck_btn_resubmit')),
             style: ElevatedButton.styleFrom(
               backgroundColor: AppColors.primary,
               foregroundColor: AppColors.surface,
@@ -369,7 +367,7 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
           if (ambiguous.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: AppSpacing.sm),
-              child: Text('还有 ${ambiguous.length} 项要你逐条拍板,不会被这个按钮自动处理。',
+              child: Text(tr('episode_step.precheck_ambiguous_note', args: {'n': '${ambiguous.length}'}),
                   style: AppTextStyles.labelSmall.copyWith(color: AppColors.warning)),
             ),
         ],
@@ -377,7 +375,7 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
     ),
     if (hits.isNotEmpty || variants.isNotEmpty)
       _Card(
-        title: '库内命中 · 直接复用(${hits.length + variants.length})',
+        title: tr('episode_step.precheck_hits_title', args: {'n': '${hits.length + variants.length}'}),
         child: Column(
           children: [...hits, ...variants].map((raw) {
             final m = (raw as Map).cast<String, dynamic>();
@@ -415,7 +413,7 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
     // 不等成片换脸了才发现。文案(refGap)由后端说人话,前端只负责呈现。
     if (refGaps.isNotEmpty)
       _Card(
-        title: '待补定妆图 · 复用但图未就绪(${refGaps.length})',
+        title: tr('episode_step.precheck_refgaps_title', args: {'n': '${refGaps.length}'}),
         child: Column(
           children: refGaps.map((raw) {
             final m = (raw as Map).cast<String, dynamic>();
@@ -445,7 +443,7 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
                                 .copyWith(fontWeight: FontWeight.w600)),
                         Text(
                           (m['refGap'] ??
-                                  (state == 'PLAN' ? '没有参考图也没有视觉描述,投产前需要补齐素材' : '定妆图还没生成,关键帧将退化为文生图'))
+                                  (state == 'PLAN' ? tr('episode_step.precheck_hit_no_ref_no_desc') : tr('episode_step.precheck_hit_ref_pending')))
                               .toString(),
                           style: AppTextStyles.labelSmall
                               .copyWith(color: AppColors.warning),
@@ -461,7 +459,7 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
       ),
     if (ambiguous.isNotEmpty) ...[
       _Card(
-        title: '需要你拍板(${ambiguous.length})',
+        title: tr('episode_step.precheck_ambiguous_title', args: {'n': '${ambiguous.length}'}),
         child: Column(
           children: ambiguous.asMap().entries.map((entry) {
             final m = (entry.value as Map).cast<String, dynamic>();
@@ -486,7 +484,7 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
                       for (final c in cands.take(3))
                         ActionChip(
                           avatar: const Icon(Icons.link, size: 13),
-                          label: Text('是「${c['name']}」', style: const TextStyle(fontSize: 11)),
+                          label: Text(tr('episode_step.precheck_btn_same_character', args: {'name': '${c['name']}'}), style: const TextStyle(fontSize: 11)),
                           backgroundColor: AppColors.surface,
                           onPressed: ctx.busy
                               ? null
@@ -495,7 +493,7 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
                       for (final c in cands.take(2))
                         ActionChip(
                           avatar: const Icon(Icons.style_outlined, size: 13),
-                          label: Text('「${c['name']}」的新造型',
+                          label: Text(tr('episode_step.precheck_btn_new_look', args: {'name': '${c['name']}'}),
                               style: const TextStyle(fontSize: 11)),
                           backgroundColor: AppColors.surface,
                           onPressed: ctx.busy
@@ -509,7 +507,8 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
                         ),
                       ActionChip(
                         avatar: const Icon(Icons.add_circle_outline, size: 13),
-                        label: const Text('不是,是新资产', style: TextStyle(fontSize: 11)),
+                        label: Text(tr('episode_step.precheck_btn_new_asset'),
+                            style: const TextStyle(fontSize: 11)),
                         backgroundColor: AppColors.surface,
                         onPressed: ctx.busy
                             ? null
@@ -529,11 +528,11 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
           }).toList(),
         ),
       ),
-      const _Hint('确认"是同一个角色"会把本集写法记进别名表,下次同样写法直接精确命中 —— 同一个问题只问一次。'),
+      _Hint(tr('episode_step.precheck_alias_hint')),
     ],
     if (news.isNotEmpty)
       _Card(
-        title: '本集新增(${news.length})',
+        title: tr('episode_step.precheck_news_title', args: {'n': '${news.length}'}),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -566,29 +565,29 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
               );
             }),
             const SizedBox(height: AppSpacing.sm),
-            Text('用上方「确认本集资产清单」一并入库;之后到资产库点「生成定妆图」才会真正出参考图。',
+            Text(tr('episode_step.precheck_news_note'),
                 style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
           ],
         ),
       ),
     if (used.isNotEmpty)
       _Card(
-        title: '本集已绑定资产(${used.length})',
+        title: tr('episode_step.precheck_used_title', args: {'n': '${used.length}'}),
         child: Wrap(
           spacing: 5, runSpacing: 5,
           children: used.map((raw) {
             final m = (raw as Map).cast<String, dynamic>();
             final v = (m['variant'] ?? '').toString();
             final shots = (m['shotIdxs'] as List?)?.length ?? 0;
-            return _Tag('${m['name'] ?? m['slug'] ?? ''}'
-                '${v.isEmpty ? '' : '·$v'}${shots > 0 ? ' ×$shots镜' : ''}', AppColors.success);
+            return WbStatusTag(label: '${m['name'] ?? m['slug'] ?? ''}'
+                '${v.isEmpty ? '' : '·$v'}${shots > 0 ? tr('episode_step.precheck_used_shots', args: {'n': '$shots'}) : ''}', color: AppColors.success);
           }).toList(),
         ),
       ),
     if (created.isNotEmpty)
       Padding(
         padding: const EdgeInsets.only(top: AppSpacing.sm),
-        child: Text('本集已回流 ${created.length} 项新资产进剧级库',
+        child: Text(tr('episode_step.precheck_reflowed', args: {'n': '${created.length}'}),
             style: AppTextStyles.labelSmall.copyWith(color: AppColors.accent)),
       ),
   ];
@@ -599,8 +598,7 @@ List<Widget> _precheckStep(EpisodeCtx ctx) {
 // ============================================================================
 List<Widget> _storyboard(EpisodeCtx ctx, BuildContext context) {
   if (!ctx.hasOutput) {
-    return const [_Hint('分镜只引用资产库里的 slug,不会自己发明人物长相 —— '
-        '长相由定妆参考图决定,文字再写一遍会和参考图打架导致换脸。')];
+    return [_Hint(tr('episode_step.storyboard_empty_hint'))];
   }
   final shots = (ctx.output['shots'] as List?) ?? const [];
   // 2026-09-16(批3):本集各场 quotes(原文逐字锚点),按 scene_idx 挂到镜头上
@@ -620,15 +618,13 @@ List<Widget> _storyboard(EpisodeCtx ctx, BuildContext context) {
   return [
     if (ctx.output['hookShotMissing'] == true)
       _Card(
-        title: '集尾钩子镜缺失',
+        title: tr('episode_step.storyboard_hook_missing_title'),
         child: Text(
-          '${(ctx.output['endHook'] is Map ? (ctx.output['endHook'] as Map)['reason'] : '') ?? ''}'
-          ' —— 末镜没留悬念,下一集开场会接不上。可重跑本步(会自动带钩子重生成一次),'
-          '或在展开末镜后手工改节奏/台词。',
+          tr('episode_step.storyboard_hook_missing_body', args: {'reason': '${(ctx.output['endHook'] is Map ? (ctx.output['endHook'] as Map)['reason'] : '') ?? ''}'}),
           style: AppTextStyles.labelSmall.copyWith(color: AppColors.warning)),
       ),
     _Card(
-      title: '分镜(${shots.length}镜)',
+      title: tr('episode_step.storyboard_title', args: {'n': '${shots.length}'}),
       child: Column(
         children: shots.map((raw) {
           final m = (raw as Map).cast<String, dynamic>();
@@ -667,24 +663,24 @@ List<Widget> _storyboard(EpisodeCtx ctx, BuildContext context) {
                           style: AppTextStyles.bodySmall.copyWith(height: 1.6)),
                       if ((m['dialogue'] ?? '').toString().isNotEmpty) ...[
                         const SizedBox(height: AppSpacing.sm),
-                        Text('台词/旁白:${m['dialogue']}',
+                        Text(tr('episode_step.storyboard_dialogue', args: {'text': '${m['dialogue']}'}),
                             style: AppTextStyles.labelSmall.copyWith(color: AppColors.textSecondary)),
                       ],
                       const SizedBox(height: AppSpacing.sm),
                       Wrap(
                         spacing: 5, runSpacing: 5,
                         children: [
-                          if (loc.isNotEmpty) _Tag('场景 $loc', AppColors.success),
-                          ...chars.map((c) => _Tag('角色 $c', AppColors.primary)),
-                          ...props.map((p) => _Tag('道具 $p', AppColors.accent)),
-                          _Tag('运镜 ${m['camera_motion'] ?? '静止'}', AppColors.textTertiary),
+                          if (loc.isNotEmpty) WbStatusTag(label: tr('episode_step.storyboard_tag_location', args: {'v': loc}), color: AppColors.success),
+                          ...chars.map((c) => WbStatusTag(label: tr('episode_step.storyboard_tag_character', args: {'v': c}), color: AppColors.primary)),
+                          ...props.map((p) => WbStatusTag(label: tr('episode_step.storyboard_tag_prop', args: {'v': p}), color: AppColors.accent)),
+                          WbStatusTag(label: tr('episode_step.storyboard_tag_camera', args: {'v': '${m['camera_motion'] ?? tr('episode_step.tag_default_still')}'}), color: AppColors.textTertiary),
                           // 节奏角色:集尾钩子门的判据,露出来用户才看得懂"为什么拦"
-                          _Tag('节奏 ${m['rhythm'] ?? '未标'}', AppColors.textTertiary),
+                          WbStatusTag(label: tr('episode_step.storyboard_tag_rhythm', args: {'v': '${m['rhythm'] ?? tr('episode_step.tag_default_unset')}'}), color: AppColors.textTertiary),
                         ],
                       ),
                       if (quotes.isNotEmpty) ...[
                         const SizedBox(height: AppSpacing.sm),
-                        Text('本场原文锚点:${quotes.join(' / ')}',
+                        Text(tr('episode_step.storyboard_anchor', args: {'quotes': quotes.join(' / ')}),
                             style: AppTextStyles.labelSmall.copyWith(
                                 fontSize: 10, color: AppColors.success)),
                       ],
@@ -711,10 +707,10 @@ List<Widget> _storyboard(EpisodeCtx ctx, BuildContext context) {
                               }
                             }
                             await ctx.onPutOutput(2, {...ctx.output, 'shots': next});
-                            ctx.toast('分镜已保存;改画面/配音需重跑第 3/4 步,改成片字幕到第 6 步重烧');
+                            ctx.toast(tr('episode_step.storyboard_saved_toast'));
                           },
                           icon: const Icon(Icons.edit_outlined, size: 14),
-                          label: const Text('改这一镜', style: TextStyle(fontSize: 11)),
+                          label: Text(tr('episode_step.edit_shot'), style: const TextStyle(fontSize: 11)),
                           style: TextButton.styleFrom(
                               padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm),
                               minimumSize: const Size(0, 26)),
@@ -730,22 +726,21 @@ List<Widget> _storyboard(EpisodeCtx ctx, BuildContext context) {
       ),
     ),
     if (ctx.output['prompt_used'] is Map) ...[
-      _Evidence('分镜提示词 · system(导演要求/节奏角色/钩子门)',
+      _Evidence(tr('episode_step.storyboard_evidence_prompt_system'),
           (((ctx.output['prompt_used'] as Map)['system'] ?? '').toString())),
-      _Evidence('分镜提示词 · user(大纲/资产索引全文)',
+      _Evidence(tr('episode_step.storyboard_evidence_prompt_user'),
           (((ctx.output['prompt_used'] as Map)['user'] ?? '').toString())),
     ],
     if (ctx.unresolvedAssets.isNotEmpty)
       _Card(
-        title: '有 ${ctx.unresolvedAssets.length} 个标识不在资产库',
+        title: tr('episode_step.storyboard_unresolved_title', args: {'n': '${ctx.unresolvedAssets.length}'}),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(ctx.unresolvedAssets.join('、'),
                 style: AppTextStyles.bodySmall.copyWith(color: AppColors.warning)),
             const SizedBox(height: AppSpacing.xs),
-            Text('这些镜头拿不到参考图,会退化成纯文字生成(脸不稳)。'
-                '建议回第 1 步处理预检,或在资产库手工补建该资产后重跑分镜。',
+            Text(tr('episode_step.storyboard_unresolved_note'),
                 style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
           ],
         ),
@@ -758,7 +753,7 @@ List<Widget> _storyboard(EpisodeCtx ctx, BuildContext context) {
 // ============================================================================
 List<Widget> _keyframes(EpisodeCtx ctx) {
   final shots = _shotsOf(ctx);
-  if (shots.isEmpty) return const [_Hint('请先完成第 2 步分镜。')];
+  if (shots.isEmpty) return [_Hint(tr('episode_step.storyboard_need_step2'))];
 
   final kfs = ((ctx.output['keyframes'] as List?) ?? const [])
       .map((e) => Map<String, dynamic>.from(e as Map))
@@ -775,7 +770,7 @@ List<Widget> _keyframes(EpisodeCtx ctx) {
 
   return [
     _Card(
-      title: '关键帧 $done/${shots.length} 镜',
+      title: tr('episode_step.keyframe_title', args: {'done': '$done', 'total': '${shots.length}'}),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -788,17 +783,16 @@ List<Widget> _keyframes(EpisodeCtx ctx) {
             ),
           ),
           const SizedBox(height: AppSpacing.sm),
-          Text('带参考图 ${ctx.output['ref_backed'] ?? 0} 镜 · '
-              '无参考退化 ${ctx.output['degraded_count'] ?? 0} 镜',
+          Text(tr('episode_step.keyframe_ref_summary', args: {'backed': '${ctx.output['ref_backed'] ?? 0}', 'degraded': '${ctx.output['degraded_count'] ?? 0}'}),
               style: AppTextStyles.labelSmall.copyWith(color: AppColors.textSecondary)),
           if (missing.isNotEmpty)
-            Text('缺参考图:${missing.join('、')} —— 请到资产库为它们「生成定妆图」后重跑该镜',
+            Text(tr('episode_step.keyframe_missing_note', args: {'list': missing.join('、')}),
                 style: AppTextStyles.labelSmall.copyWith(color: AppColors.warning)),
           const SizedBox(height: AppSpacing.sm),
           OutlinedButton.icon(
             onPressed: ctx.busy ? null : () => ctx.onGenerate(3),
             icon: const Icon(Icons.playlist_play, size: 16),
-            label: Text(done == 0 ? '生成全部 ${shots.length} 镜' : '补齐未完成镜头'),
+            label: Text(done == 0 ? tr('episode_step.keyframe_btn_generate_all', args: {'n': '${shots.length}'}) : tr('episode_step.fill_missing')),
             style: OutlinedButton.styleFrom(
                 foregroundColor: AppColors.primary,
                 padding: const EdgeInsets.symmetric(vertical: AppSpacing.md)),
@@ -865,11 +859,11 @@ List<Widget> _keyframes(EpisodeCtx ctx) {
                   ),
                   const SizedBox(height: AppSpacing.xs),
                   if (isDegraded)
-                    Text('无参考图 · 本镜靠文字描述,脸可能不稳',
+                    Text(tr('episode_step.keyframe_shot_degraded'),
                         style: AppTextStyles.labelSmall.copyWith(
                             fontSize: 10, color: AppColors.warning))
                   else if (refs.isNotEmpty)
-                    Text('参考:${refs.map((r) => '${r['name']}/${r['angle']}').join(' ')}',
+                    Text(tr('episode_step.keyframe_shot_refs', args: {'refs': refs.map((r) => '${r['name']}/${r['angle']}').join(' ')}),
                         maxLines: 2, overflow: TextOverflow.ellipsis,
                         style: AppTextStyles.labelSmall.copyWith(
                             fontSize: 10, color: AppColors.success)),
@@ -883,8 +877,8 @@ List<Widget> _keyframes(EpisodeCtx ctx) {
                     ),
                   // 2026-09-16(批3):关键帧 prompt + 参考图 URL 露出,换脸/坏图可溯源
                   if ((k?['prompt'] ?? '').toString().isNotEmpty)
-                    _Evidence('关键帧 prompt #$idx',
-                        '${k?['prompt']}\n参考图:${_joinRefs(k)}'),
+                    _Evidence(tr('episode_step.keyframe_prompt_label', args: {'n': '$idx'}),
+                        tr('episode_step.keyframe_copy_text', args: {'prompt': '${k?['prompt']}', 'refs': _joinRefs(k)})),
                 ],
               ),
             ),
@@ -892,12 +886,12 @@ List<Widget> _keyframes(EpisodeCtx ctx) {
             url.isNotEmpty
                 ? IconButton(
                     icon: const Icon(Icons.refresh, size: 18),
-                    tooltip: '重出这一镜',
+                    tooltip: tr('episode_step.keyframe_tooltip_regen'),
                     onPressed: ctx.busy ? null : () => ctx.onGenerate(3, body: {'shotIdx': idx}),
                   )
                 : TextButton(
                     onPressed: ctx.busy ? null : () => ctx.onGenerate(3, body: {'shotIdx': idx}),
-                    child: const Text('出这镜', style: TextStyle(fontSize: 12)),
+                    child: Text(tr('episode_step.gen_shot'), style: const TextStyle(fontSize: 12)),
                   ),
           ],
         ),
@@ -913,7 +907,7 @@ List<Widget> _videos(EpisodeCtx ctx) {
   final shots = _shotsOf(ctx);
   final kfs = ((ctx.episode['stepData'] as Map?)?['3']?['output']?['keyframes'] as List?)
       ?? const [];
-  if (kfs.isEmpty) return const [_Hint('请先完成第 3 步关键帧。')];
+  if (kfs.isEmpty) return [_Hint(tr('episode_step.keyframe_need_step3'))];
 
   final list = ((ctx.output['shots'] as List?) ?? const [])
       .map((e) => Map<String, dynamic>.from(e as Map))
@@ -932,18 +926,17 @@ List<Widget> _videos(EpisodeCtx ctx) {
 
   return [
     _Card(
-      title: '分镜视频 $doneCount/$shots.length',
+      title: tr('episode_step.video_title', args: {'done': '$doneCount', 'total': '${shots.length}'}),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('上游限制每个密钥每分钟只能创建 1 次视频任务,整集跑完通常 5~25 分钟。'
-              '已完成的镜头不会被重烧。',
+          Text(tr('episode_step.video_note'),
               style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
           const SizedBox(height: AppSpacing.sm),
           OutlinedButton.icon(
             onPressed: ctx.busy ? null : () => ctx.onGenerate(4),
             icon: const Icon(Icons.movie_creation_outlined, size: 16),
-            label: Text(doneCount == 0 ? '开始生成全部' : '补齐未完成镜头'),
+            label: Text(doneCount == 0 ? tr('episode_step.video_btn_start_all') : tr('episode_step.fill_missing')),
             style: OutlinedButton.styleFrom(
                 foregroundColor: AppColors.primary,
                 padding: const EdgeInsets.symmetric(vertical: AppSpacing.md)),
@@ -961,10 +954,10 @@ List<Widget> _videos(EpisodeCtx ctx) {
 
       Color color;
       String label;
-      if (url.isNotEmpty) { color = AppColors.success; label = '已完成'; }
-      else if (status == 'failed') { color = AppColors.danger; label = '失败'; }
-      else if (!ready) { color = AppColors.textTertiary; label = '缺关键帧'; }
-      else { color = AppColors.textTertiary; label = '待生成'; }
+      if (url.isNotEmpty) { color = AppColors.success; label = tr('episode_step.video_status_done'); }
+      else if (status == 'failed') { color = AppColors.danger; label = tr('episode_step.video_status_failed'); }
+      else if (!ready) { color = AppColors.textTertiary; label = tr('episode_step.video_status_no_keyframe'); }
+      else { color = AppColors.textTertiary; label = tr('episode_step.video_status_pending'); }
 
       return Container(
         margin: const EdgeInsets.only(bottom: AppSpacing.sm),
@@ -988,7 +981,7 @@ List<Widget> _videos(EpisodeCtx ctx) {
                       style: AppTextStyles.labelSmall),
                   Text('$label'
                       '${v?['duration_sec'] != null ? ' · ${v?['duration_sec']}s' : ''}'
-                      '${v?['reused'] == true ? ' · 沿用上轮' : ''}',
+                      '${v?['reused'] == true ? tr('episode_step.video_tag_reused') : ''}',
                       style: AppTextStyles.labelSmall.copyWith(fontSize: 10, color: color)),
                   if ((v?['error'] ?? '').toString().isNotEmpty)
                     Text('${v?['error']}',
@@ -1008,14 +1001,14 @@ List<Widget> _videos(EpisodeCtx ctx) {
                 icon: const Icon(Icons.play_circle_outline, size: 20),
                 color: AppColors.success,
                 onPressed: () => webOpenInNewTab(Uri.parse(ApiClient.resolveUrl(url))),
-                tooltip: '播放这一镜',
+                tooltip: tr('episode_step.video_tooltip_play'),
               )
             else
               TextButton(
                 onPressed: (!ready || ctx.busy)
                     ? null
                     : () => ctx.onGenerate(4, body: {'shotIdx': idx}),
-                child: const Text('出这镜', style: TextStyle(fontSize: 12)),
+                child: Text(tr('episode_step.gen_shot'), style: const TextStyle(fontSize: 12)),
               ),
           ],
         ),
@@ -1038,16 +1031,16 @@ List<Widget> _finalCut(EpisodeCtx ctx) {
 
   return [
     _Card(
-      title: '合成成片',
+      title: tr('episode_step.compose_title'),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('已就绪镜头 $ready/${videos.length}。合成会把它们按顺序拼接并生成字幕文件。',
+          Text(tr('episode_step.compose_ready_note', args: {'ready': '$ready', 'total': '${videos.length}'}),
               style: AppTextStyles.labelSmall.copyWith(color: AppColors.textSecondary)),
           if (ready == 0)
             Padding(
               padding: const EdgeInsets.only(top: AppSpacing.xs),
-              child: Text('还没有任何镜头视频,先回第 4 步生成。',
+              child: Text(tr('episode_step.compose_empty_note'),
                   style: AppTextStyles.labelSmall.copyWith(color: AppColors.warning)),
             ),
         ],
@@ -1055,13 +1048,18 @@ List<Widget> _finalCut(EpisodeCtx ctx) {
     ),
     if (finalUrl.isNotEmpty)
       _Card(
-        title: '本集成片',
+        title: tr('episode_step.compose_result_title'),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('${out['duration_sec'] ?? ctx.episode['durationSec'] ?? 0} 秒'
-                '${out['segment_count'] != null ? ' · ${out['segment_count']} 段' : ''}'
-                '${out['size_bytes'] != null ? ' · ${(out['size_bytes'] as num).toInt() ~/ 1048576} MB' : ''}',
+            Text(tr('episode_step.compose_meta_duration',
+                    args: {'sec': '${out['duration_sec'] ?? ctx.episode['durationSec'] ?? 0}'}) +
+                (out['segment_count'] != null
+                    ? tr('episode_step.compose_meta_segments', args: {'n': '${out['segment_count']}'})
+                    : '') +
+                (out['size_bytes'] != null
+                    ? tr('episode_step.compose_meta_size', args: {'n': '${(out['size_bytes'] as num).toInt() ~/ 1048576}'})
+                    : ''),
                 style: AppTextStyles.bodyMedium.copyWith(fontWeight: FontWeight.w600)),
             const SizedBox(height: AppSpacing.sm),
             Row(
@@ -1071,6 +1069,7 @@ List<Widget> _finalCut(EpisodeCtx ctx) {
                       style: AppTextStyles.labelSmall.copyWith(color: AppColors.primary)),
                 ),
                 IconButton(
+                  tooltip: tr('common.play'),
                   icon: const Icon(Icons.play_circle_outline, size: 22),
                   color: AppColors.primary,
                   onPressed: () => webOpenInNewTab(Uri.parse(ApiClient.resolveUrl(finalUrl))),
@@ -1080,7 +1079,7 @@ List<Widget> _finalCut(EpisodeCtx ctx) {
             if ((out['subtitle_url'] ?? '').toString().isNotEmpty)
               Padding(
                 padding: const EdgeInsets.only(top: AppSpacing.xs),
-                child: Text('字幕:${out['subtitle_url']}',
+                child: Text(tr('episode_step.compose_subtitle_url', args: {'url': '${out['subtitle_url']}'}),
                     style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
               ),
           ],
@@ -1089,18 +1088,17 @@ List<Widget> _finalCut(EpisodeCtx ctx) {
     // 2026-09-16(批3 透明工作台):缺镜/成片门/质检/回顾/字幕全文 —— 成片不再黑盒
     if (((out['missing_shots'] as num?) ?? 0) > 0)
       _Card(
-        title: '缺 ${out['missing_shots']} 镜 · 成片 ${out['duration_sec'] ?? 0}s / 计划 ${out['planned_shots'] ?? 0} 镜',
+        title: tr('episode_step.compose_missing_title', args: {'missing': '${out['missing_shots']}', 'dur': '${out['duration_sec'] ?? 0}', 'planned': '${out['planned_shots'] ?? 0}'}),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('失败或缺关键帧的镜头没进成片(上游 503 队列满是最常见原因)。'
-                '补做会复用已成功镜头,只重跑失败镜,不重复烧配额。',
+            Text(tr('episode_step.compose_missing_note'),
                 style: AppTextStyles.labelSmall.copyWith(color: AppColors.textSecondary)),
             const SizedBox(height: AppSpacing.sm),
             OutlinedButton.icon(
               onPressed: ctx.busy ? null : ctx.onSupplementShots,
               icon: const Icon(Icons.healing, size: 16),
-              label: const Text('一键补做失败镜并重合成'),
+              label: Text(tr('episode_step.compose_btn_heal')),
               style: OutlinedButton.styleFrom(
                   foregroundColor: AppColors.warning,
                   padding: const EdgeInsets.symmetric(vertical: AppSpacing.md)),
@@ -1110,12 +1108,9 @@ List<Widget> _finalCut(EpisodeCtx ctx) {
       ),
     if (out['compose_gate'] is Map)
       _Card(
-        title: '成片门判定',
+        title: tr('episode_step.compose_gate_title'),
         child: (out['compose_gate'] as Map)['passed'] == true
-            ? Text('达标:存活 ${((out['compose_gate'] as Map)['composed'] ?? 0)}/'
-                '${((out['compose_gate'] as Map)['planned'] ?? 0)} 镜 · '
-                '${((out['compose_gate'] as Map)['durationSec'] ?? 0).toString()}s ≥ '
-                '${((out['compose_gate'] as Map)['minDurationSec'] ?? 0)}s 门',
+            ? Text(tr('episode_step.compose_gate_passed', args: {'composed': '${((out['compose_gate'] as Map)['composed'] ?? 0)}', 'planned': '${((out['compose_gate'] as Map)['planned'] ?? 0)}', 'dur': '${((out['compose_gate'] as Map)['durationSec'] ?? 0)}', 'min': '${((out['compose_gate'] as Map)['minDurationSec'] ?? 0)}'}),
                 style: AppTextStyles.bodySmall.copyWith(color: AppColors.success))
             : Text(
                 (((out['compose_gate'] as Map)['reasons'] as List?) ?? const [])
@@ -1124,28 +1119,23 @@ List<Widget> _finalCut(EpisodeCtx ctx) {
       ),
     if (out['audit'] is Map && (out['audit'] as Map)['skipped'] != true)
       _Card(
-        title: '拉片质检(客观指标)',
+        title: tr('episode_step.audit_title'),
         child: Text(
-          '${(out['audit'] as Map)['shotCount'] ?? 0} 镜 · 均镜长 '
-          '${((out['audit'] as Map)['avgShotSec'] as num?)?.toStringAsFixed(1) ?? '?'}s · '
-          '每分钟 ${(out['audit'] as Map)['cutsPerMin'] ?? 0} 切 · '
-          '死镜 ${(((out['audit'] as Map)['staticShots'] as List?) ?? const []).length} · '
-          '硬跳接缝 ${(((out['audit'] as Map)['seamOutliers'] as List?) ?? const []).length} → '
-          '${(out['audit'] as Map)['verdict'] ?? ''}',
+          tr('episode_step.audit_summary', args: {'shots': '${(out['audit'] as Map)['shotCount'] ?? 0}', 'avg': ((out['audit'] as Map)['avgShotSec'] as num?)?.toStringAsFixed(1) ?? '?', 'cuts': '${(out['audit'] as Map)['cutsPerMin'] ?? 0}', 'static': '${(((out['audit'] as Map)['staticShots'] as List?) ?? const []).length}', 'seams': '${(((out['audit'] as Map)['seamOutliers'] as List?) ?? const []).length}', 'verdict': (out['audit'] as Map)['verdict'] ?? ''}),
           style: AppTextStyles.labelSmall.copyWith(color: AppColors.textSecondary)),
       ),
     if (out['recap'] is Map)
       _Card(
-        title: '集首视觉回顾',
+        title: tr('episode_step.recap_title'),
         child: (out['recap'] as Map)['enabled'] == true
-            ? Text('已接 3s 上集尾帧淡入 + 字卡:「${(out['recap'] as Map)['text'] ?? ''}」',
+            ? Text(tr('episode_step.recap_enabled', args: {'text': '${(out['recap'] as Map)['text'] ?? ''}'}),
                 style: AppTextStyles.labelSmall.copyWith(color: AppColors.success))
-            : Text('本集未接回顾:${(out['recap'] as Map)['reason'] ?? '非第 2 集起/上集无成片'}',
+            : Text(tr('episode_step.recap_disabled', args: {'reason': '${(out['recap'] as Map)['reason'] ?? tr('episode_step.recap_reason_default')}'}),
                 style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
       ),
     if (((out['subtitle_cues'] as List?) ?? const []).isNotEmpty)
       _Card(
-        title: '字幕全文(${((out['subtitle_cues'] as List?) ?? const []).length}条)· 可改可重烧',
+        title: tr('episode_step.subtitle_title', args: {'n': '${((out['subtitle_cues'] as List?) ?? const []).length}'}),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -1156,7 +1146,7 @@ List<Widget> _finalCut(EpisodeCtx ctx) {
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('${_mmss((c['startSec'] as num?) ?? 0)}',
+                    Text(_mmss((c['startSec'] as num?) ?? 0),
                         style: AppTextStyles.labelSmall.copyWith(
                             fontSize: 10, color: AppColors.textTertiary)),
                     const SizedBox(width: AppSpacing.sm),
@@ -1167,7 +1157,7 @@ List<Widget> _finalCut(EpisodeCtx ctx) {
                     IconButton(
                       visualDensity: VisualDensity.compact,
                       icon: const Icon(Icons.edit_outlined, size: 14),
-                      tooltip: '改这条字幕',
+                      tooltip: tr('episode_step.subtitle_tooltip_edit'),
                       onPressed: ctx.busy ? null : () => ctx.onEditCue(c),
                     ),
                   ],
@@ -1176,13 +1166,13 @@ List<Widget> _finalCut(EpisodeCtx ctx) {
             }),
             if (ctx.pendingSubEdits.isNotEmpty) ...[
               const SizedBox(height: AppSpacing.sm),
-              Text('已记下 ${ctx.pendingSubEdits.length} 处修改,待重烧',
+              Text(tr('episode_step.subtitle_pending', args: {'n': '${ctx.pendingSubEdits.length}'}),
                   style: AppTextStyles.labelSmall.copyWith(color: AppColors.warning)),
               const SizedBox(height: AppSpacing.sm),
               OutlinedButton.icon(
                 onPressed: ctx.busy ? null : () => ctx.onReburnSubtitles(ctx.pendingSubEdits),
                 icon: const Icon(Icons.subtitles_outlined, size: 16),
-                label: Text('重烧字幕(${ctx.pendingSubEdits.length}处) · 复用已合成画面,不烧视频配额'),
+                label: Text(tr('episode_step.subtitle_btn_reburn', args: {'n': '${ctx.pendingSubEdits.length}'})),
                 style: OutlinedButton.styleFrom(
                     foregroundColor: AppColors.primary,
                     padding: const EdgeInsets.symmetric(vertical: AppSpacing.md)),
@@ -1191,8 +1181,7 @@ List<Widget> _finalCut(EpisodeCtx ctx) {
             if (out['subtitle_needs_realign'] == true)
               Padding(
                 padding: const EdgeInsets.only(top: AppSpacing.sm),
-                child: Text('注意:有修改字数变化超阈值,字幕时间窗未重算 —— '
-                    '精确对齐需重跑分镜视频后重新合成。',
+                child: Text(tr('episode_step.subtitle_window_warn'),
                     style: AppTextStyles.labelSmall.copyWith(color: AppColors.warning)),
               ),
           ],
@@ -1200,24 +1189,24 @@ List<Widget> _finalCut(EpisodeCtx ctx) {
       ),
     if (out.isNotEmpty)
       _Card(
-        title: '世界状态回写',
+        title: tr('episode_step.worldstate_title'),
         child: updated == false
-            ? Text(notice.isEmpty ? '快照未更新:本集序号早于快照来源集。' : notice,
+            ? Text(notice.isEmpty ? tr('episode_step.worldstate_not_updated') : notice,
                 style: AppTextStyles.bodySmall.copyWith(color: AppColors.danger))
             : Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('快照已推进到 EP${ctx.epNo}',
+                  Text(tr('episode_step.worldstate_advanced', args: {'n': '${ctx.epNo}'}),
                       style: AppTextStyles.bodySmall.copyWith(color: AppColors.success)),
                   const SizedBox(height: AppSpacing.xs),
-                  Text('本集钩子已交给下一集:建集时会自动填进「要接住」栏。',
+                  Text(tr('episode_step.worldstate_hook_handoff'),
                       style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
                 ],
               ),
       ),
     if ((ctx.episode['hookOut'] ?? '').toString().isNotEmpty)
       _Card(
-        title: '下一集将接住',
+        title: tr('episode_step.worldstate_next_hook_title'),
         child: Text('${ctx.episode['hookOut']}',
             style: AppTextStyles.bodyMedium.copyWith(color: AppColors.warning)),
       ),
@@ -1235,7 +1224,7 @@ List<Widget> _warnings(EpisodeCtx ctx) {
   if (ctx.warnings.isEmpty) return const [];
   return [
     _Card(
-      title: '注意(${ctx.warnings.length})',
+      title: tr('episode_step.warnings_title', args: {'n': '${ctx.warnings.length}'}),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: ctx.warnings
@@ -1278,24 +1267,6 @@ class _Card extends StatelessWidget {
   }
 }
 
-class _Tag extends StatelessWidget {
-  final String text;
-  final Color color;
-  const _Tag(this.text, this.color);
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xxs),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(AppColors.tagRadius),
-      ),
-      child: Text(text, style: AppTextStyles.labelSmall.copyWith(
-           color: color, fontWeight: FontWeight.w600)),
-    );
-  }
-}
 
 class _Hint extends StatelessWidget {
   final String text;
@@ -1339,7 +1310,7 @@ class _ErrorBox extends StatelessWidget {
             children: [
               Icon(Icons.error_outline, size: 16, color: AppColors.danger),
               const SizedBox(width: AppSpacing.sm),
-              Expanded(child: Text('第 ${step + 1} 步失败', style: AppTextStyles.labelSmall.copyWith(
+              Expanded(child: Text(tr('episode_step.step_failed', args: {'n': '${step + 1}'}), style: AppTextStyles.labelSmall.copyWith(
                   color: AppColors.danger, fontWeight: FontWeight.w700),
                   maxLines: 1, overflow: TextOverflow.ellipsis)),
               const Spacer(),
@@ -1348,7 +1319,7 @@ class _ErrorBox extends StatelessWidget {
                 style: TextButton.styleFrom(
                     foregroundColor: AppColors.danger,
                     padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md)),
-                child: const Text('重试', style: TextStyle(fontSize: 12)),
+                child: Text(tr('common.retry'), style: const TextStyle(fontSize: 12)),
               ),
             ],
           ),
@@ -1381,7 +1352,7 @@ String _mmss(num sec) {
 /// 关键帧参考图 URL 列表 → 展示文本(空 = 文生图降级)
 String _joinRefs(dynamic k) {
   final urls = (((k as Map?)?['ref_urls'] as List?) ?? const []).join(' ');
-  return urls.isEmpty ? '无(文生图降级)' : urls;
+  return urls.isEmpty ? tr('episode_step.keyframe_no_ref_placeholder') : urls;
 }
 
 class _Evidence extends StatelessWidget {
@@ -1448,33 +1419,33 @@ class _ShotEditDialogState extends State<_ShotEditDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('改这一镜', style: TextStyle(fontSize: 15)),
+      title: Text(tr('episode_step.edit_shot'), style: const TextStyle(fontSize: 15)),
       content: SizedBox(
         width: 420,
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('画面描述(供图像/视频生成)', style: AppTextStyles.labelSmall),
+            Text(tr('episode_step.dialog_field_desc'), style: AppTextStyles.labelSmall),
             const SizedBox(height: AppSpacing.xs),
             TextField(controller: _desc, maxLines: 3, style: AppTextStyles.bodySmall),
             const SizedBox(height: AppSpacing.md),
-            Text('台词/旁白(决定配音与字幕来源)', style: AppTextStyles.labelSmall),
+            Text(tr('episode_step.dialog_field_dialogue'), style: AppTextStyles.labelSmall),
             const SizedBox(height: AppSpacing.xs),
             TextField(controller: _dlg, maxLines: 3, style: AppTextStyles.bodySmall),
             const SizedBox(height: AppSpacing.sm),
-            Text('保存后:重跑第 3/4 步才会改画面与配音;只改成片字幕显示请到第 6 步改字幕重烧。',
+            Text(tr('episode_step.dialog_save_note'),
                 style: AppTextStyles.labelSmall.copyWith(fontSize: 10, color: AppColors.textTertiary)),
           ],
         ),
       ),
       actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('取消')),
+        TextButton(onPressed: () => Navigator.pop(context), child: Text(tr('common.cancel'))),
         FilledButton(
           onPressed: () => Navigator.pop(context, {
             'description': _desc.text, 'dialogue': _dlg.text,
           }),
-          child: const Text('保存'),
+          child: Text(tr('common.save')),
         ),
       ],
     );

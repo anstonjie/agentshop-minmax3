@@ -39,6 +39,7 @@ import {
   VISUAL_QC_SYS, VISUAL_QC_MAX_REDRAW, buildVisualQcQuestion, parseVisualQcVerdict,
 } from './visual-qc';
 import { planDegradedRetry } from './degraded-retry';
+import { resolveEpisodeTargetSec } from './episode-budget';
 import { dramaNovelDir } from '../../common/paths';
 
 const DEFAULT_AGENT_ID = 201;
@@ -1501,11 +1502,9 @@ export class DramaService {
     const styleSpec = this.parseJson(drama.styleSpec, {});
     const scopeTag = `${drama.uuid}-ep${epNo}`;
     const started = Date.now();
-    // 本集目标时长(秒)。批次会透传 input.targetSec;手动单步生成时前端不一定带,
-    // 那就回落到账本 ingest 时用户选定的值。**必须在这里统一解析** ——
-    // 之前只有 n2d-core 的切集步骤知道这个值,生成链路完全不知道,于是
-    // 用户选 120 秒、大纲走兜底"2-3 分钟"、分镜每镜 3 秒,成片只有 43 秒。
-    const targetSec = await this.resolveEpTargetSec(drama.id, input?.targetSec);
+    // 本集目标时长(秒)。每集优先走**它自己那集的内容折时**(账本 episodes[epNo].budget_sec),
+    // 不再被整剧一个 ep_target_sec 通吃 —— 详见 resolveEpTargetSec。批次/手动没带就回退账本。
+    const targetSec = await this.resolveEpTargetSec(drama.id, epNo, input?.targetSec);
 
     const save = async (payload: any) => {
       sd[String(step)] = {
@@ -1678,9 +1677,15 @@ export class DramaService {
 
       // ── 3 关键帧:参考图驱动 ──
       case 3: {
+        // 2026-09-22:分段计时。实测(18 key 池)图像 API 本身不慢 —— 无参考图 ~9s、
+        // 1 张参考图 ~21s、2 张 ~30s,而且**并发度不影响单张耗时**(并发 3/9/18
+        // 的总墙钟都是 ~30s)。可批次日志显示这一步整段要 6~8 分钟,差一个数量级。
+        // 差额到底在 refAssetIndex / 出图 / save 落库哪一段,以前只能猜,现在打点。
+        const tStep3 = Date.now();
         const shotOut = sd['2']?.output;
         if (!shotOut?.shots?.length) throw new BadRequestException('请先生成分镜脚本(第 2 步)');
         const idx = await this.refAssetIndex(drama.id);
+        const tIdx = Date.now() - tStep3;
         const plans = shotOut.shots.map((sh: any) =>
           buildKeyframePlan(sh, idx, styleSpec));
         // 逐镜推进:整集十几镜一次跑完仍要几分钟,指定 shotIdx 时只画这一镜,
@@ -1716,6 +1721,15 @@ export class DramaService {
                 degraded: plan.degraded,
               };
             } catch (e: any) {
+              const fallbackUrl = (plan.refUrls || []).find((u: string) => typeof u === 'string' && /^https?:\/\//i.test(u));
+              if (fallbackUrl) {
+                this.logger.warn(`[ep-step3] 镜 #${plan.shotIdx} 出图失败(${e?.message}), 自动使用定妆图兜底关键帧首帧`);
+                return {
+                  shot_idx: plan.shotIdx, url: fallbackUrl, prompt: plan.prompt,
+                  ref_urls: plan.refUrls, ref_sources: plan.refSources,
+                  degraded: plan.degraded, fallback_to_ref: true,
+                };
+              }
               return {
                 shot_idx: plan.shotIdx, url: null, prompt: plan.prompt,
                 ref_urls: plan.refUrls, ref_sources: plan.refSources,
@@ -1724,7 +1738,9 @@ export class DramaService {
             }
           })();
         });
+        const tDraw0 = Date.now();
         const keyframes = await Promise.all(tasks);
+        const tDraw = Date.now() - tDraw0;
         const drawn = onlyShot != null
           ? plans.filter((x) => x.shotIdx === onlyShot) : plans;
         const withRef = drawn.filter((x) => !x.degraded).length;
@@ -1741,6 +1757,10 @@ export class DramaService {
           `带参考图 ${withRef} 镜,缺参考资产:${missing.join(',') || '无'}` +
           (degradedRetry.enabled ? `,degraded 待重生 #${degradedRetry.retry.join(',#') || '无'}` : ''),
         );
+        this.logger.log(
+          `[ep-step3][计时] EP${epNo} 资产索引 ${tIdx}ms / 出图 ${tDraw}ms(${(tDraw / 1000).toFixed(1)}s)` +
+          ` / ${keyframes.length} 镜并行,参考图合计 ${plans.reduce((n, p) => n + ((p.refUrls || []).length), 0)} 张`,
+        );
         const result = await save({
           keyframes,
           ref_backed: keyframes.filter((k: any) => (k.ref_urls || []).length > 0).length,
@@ -1748,6 +1768,10 @@ export class DramaService {
           missing_refs: missing,
           degraded_retry: degradedRetry,
         });
+        this.logger.log(
+          `[ep-step3][计时] EP${epNo} 落库 ${Date.now() - tStep3 - tIdx - tDraw}ms;` +
+          `本步总计 ${Date.now() - tStep3}ms(${(Math.round((Date.now() - tStep3) / 100) / 10)}s)`,
+        );
         return { ...result, missing_refs: missing };
       }
 
@@ -2392,29 +2416,28 @@ export class DramaService {
   }
 
   /**
-   * 解析本剧的「单集目标时长」(秒)。
+   * 解析「第 epNo 集」的目标时长(秒)。
    *
-   * 取值优先级:调用方入参 → 账本 `meta.budget.ep_target_sec`(用户在表单里选的)
-   * → 120 秒兜底。
+   * 2026-09-22 修:不再"整剧一个 ep_target_sec 通吃每集"。每集优先按**它自己那集
+   * 覆盖章节的内容折时**(`ledgerJson.episodes[epNo].budget_sec`,n2d-core 已按
+   * 对白/动作字数算好、集集不同)取,夹持到柔性区间(默认 45–240s);拿不到才依次
+   * 回退到调用方入参 → 全局 `meta.budget.ep_target_sec` → 120。决策逻辑收在
+   * `episode-budget.resolveEpisodeTargetSec` 这个纯函数里(单一决策点、可单测)。
    *
-   * 为什么要回落到账本:连集批次会透传 targetSec,但手动单步生成
-   * (`POST /episodes/:epNo/steps/:step/generate`)与历史数据都不会带。
-   * 不回落的后果是同一部剧在两条路径下产出不同长度的大纲 —— 而用户
-   * 在表单里明明选过一次,系统不该"忘了"。
+   * 为什么回落到账本:连集批次会透传 targetSec,但手动单步生成
+   * (`POST /episodes/:epNo/steps/:step/generate`)与历史数据不一定带。非原著驱动的
+   * 普通剧没有 ledger/episodes,会自动落到入参/兜底分支,行为不变。
    */
-  private async resolveEpTargetSec(dramaId: bigint, fromInput: any): Promise<number> {
-    const n = Number(fromInput);
-    if (Number.isFinite(n) && n > 0) return Math.round(n);
+  private async resolveEpTargetSec(dramaId: bigint, epNo: number, fromInput: any): Promise<number> {
+    let lj: any = null;
     try {
       const rows = await this.prisma.$queryRawUnsafe<{ lj: any }[]>(
         'SELECT `ledgerJson` AS lj FROM `dramas_novel_ledger` WHERE `dramaId` = ? LIMIT 1',
         dramaId,
       );
-      const lj = this.parseJson(rows[0]?.lj, null);
-      const v = Number(lj?.meta?.budget?.ep_target_sec);
-      if (Number.isFinite(v) && v > 0) return Math.round(v);
-    } catch { /* 账本缺失或 JSON 异常 → 走兜底,不让它阻断生成 */ }
-    return 120;
+      lj = this.parseJson(rows[0]?.lj, null);
+    } catch { /* 账本缺失或 JSON 异常 → 走回退,不让它阻断生成 */ }
+    return resolveEpisodeTargetSec(lj, epNo, Number(fromInput));
   }
 
   private s(v: any): string | null {

@@ -51,6 +51,13 @@ export const batchRoom = (batchUuid: string) => `batch:${batchUuid}`;
  */
 export const DEGRADED_RATIO_BLOCK = 0.5;
 
+/** 僵尸巡检:worker 刚接手 active job 的竞态宽限(此期间内不判定为僵尸) */
+export const ZOMBIE_GRACE_MS = 2 * 60 * 1000;
+/** 僵尸巡检:批次 updatedAt 在这个间隔内有更新,就认为有活的执行者(防跨进程误杀) */
+export const ZOMBIE_ACTIVE_FRESH_MS = 3 * 60 * 1000;
+/** 僵尸巡检:同一批次两次"自动续跑"之间的冷却,避免卡住→重入→又卡住的循环 */
+export const AUTO_RESUME_COOLDOWN_MS = 30 * 60 * 1000;
+
 /**
  * 本集关键帧是否退化到"不该继续烧视频配额"的程度。
  *
@@ -149,6 +156,9 @@ export class DramaOrchestrator implements OnApplicationBootstrap {
   /** 本进程正在跑的批次,用于快速取消与防重复启动 */
   private readonly running = new Map<string, { cancel: boolean }>();
 
+  /** 巡检自动续跑的时间戳(批次 uuid → ms),用于冷却,防重复拉起 */
+  private readonly autoResumedAt = new Map<string, number>();
+
   constructor(
     private readonly svc: DramaService,
     private readonly queue: QueueService,
@@ -225,6 +235,91 @@ export class DramaOrchestrator implements OnApplicationBootstrap {
     } catch (e: any) {
       this.logger.warn(`恢复中断批次失败(不影响启动): ${e?.message}`);
     }
+  }
+
+  /**
+   * 僵尸槽位巡检:清掉占着 `concurrency=1` 唯一槽位、却不可能再推进的 active job。
+   * 由 `NovelPipelineService.scheduledGateSweep()` 每 5 分钟调用。
+   *
+   * 背景(2026-09-22 实测):一个跑了 11 小时卡在 EP9 的遗留批次被用户取消后,
+   * DB 状态已经是 cancelled,但 Redis 里的 active job 还带锁占着槽位 —— 之后
+   * 新建的批次全部"入队成功、一步不跑"。救火只能手动 `DEL ...:lock` + clean,
+   * 而这事本该由程序自己发现。
+   *
+   * 判据(三条,任一命中即清):
+   *   ① 批次记录不存在 / 已 done|failed|cancelled → 无论如何都不该再占槽位;
+   *   ② 批次仍是 running,但**本进程没有它的执行者** —— 单机部署下 worker 就是
+   *      本进程注册的,`running` map 里没有它 = 执行者是上一轮被杀的进程;
+   *   ③ 排除竞态:worker 刚接手还没写进 running map(2 分钟宽限)、
+   *      或批次 3 分钟内还有进度写入(防跨进程误杀)。
+   *
+   * 清完之后:若批次仍是 running(用户没放弃),自动重新入队续跑 ——
+   * 断点由 cursorEp/cursorStep 保证,已完成的步骤会被幂等跳过,不会重烧配额。
+   * 同一批次的自动恢复有 30 分钟冷却,避免"卡住→重入→又卡住"的无限循环。
+   */
+  async sweepZombieDramaSlots(): Promise<number> {
+    if (!this.queue.dramaQueueAvailable) return 0;
+    const actives = await this.queue.listDramaActiveJobs().catch(() => []);
+    if (!actives.length) return 0;
+
+    let cleaned = 0;
+    for (const a of actives) {
+      const bUuid = a.batchUuid;
+      // ③-a 本进程正在跑 → 活的
+      if (bUuid && this.running.has(bUuid)) continue;
+      // ③-b worker 刚接手(还没写进 running map)→ 给它 2 分钟
+      if (a.processedOn && Date.now() - a.processedOn < ZOMBIE_GRACE_MS) continue;
+
+      const batch = bUuid
+        ? await this.svc.getBatch(bUuid).catch(() => null)
+        : null;
+      const status: string | null = batch?.status ?? null;
+
+      if (status === 'running') {
+        const freshMs = batch?.updatedAt
+          ? Date.now() - new Date(batch.updatedAt).getTime() : Infinity;
+        // ③-c 3 分钟内还有进度写入 → 有活的执行者(可能是别的进程),不碰
+        if (Number.isFinite(freshMs) && freshMs < ZOMBIE_ACTIVE_FRESH_MS) continue;
+      }
+
+      const reason = !batch
+        ? '批次记录已不存在'
+        : ['done', 'failed', 'cancelled'].includes(status as string)
+          ? `批次已 ${status}`
+          : 'DB 仍是 running 但本进程没有执行者(上一轮进程留下的僵尸)';
+
+      const ok = await this.queue.purgeDramaJob(a.jobId).catch(() => false);
+      if (!ok) {
+        this.logger.warn(`[巡检] 僵尸槽位 ${a.jobId} 清理失败(${reason}),下个周期再试`);
+        continue;
+      }
+      cleaned += 1;
+      this.logger.warn(`[巡检] 已清理僵尸槽位 ${a.jobId}(${reason})`);
+
+      if (!batch || !bUuid) continue;
+      if (status !== 'running') continue; // 用户已取消/已收尾,不再拉起
+
+      const last = this.autoResumedAt.get(bUuid) ?? 0;
+      if (Date.now() - last < AUTO_RESUME_COOLDOWN_MS) continue;
+      this.autoResumedAt.set(bUuid, Date.now());
+      try {
+        await this.queue.enqueueDramaBatch(
+          { batchUuid: bUuid, dramaUuid: String(batch.dramaUuid || ''), userId: Number(batch.userId) },
+          { force: true },
+        );
+        await this.svc.appendBatchLog(bUuid, {
+          ep: Number(batch.cursorEp) || 0, step: Number(batch.cursorStep) || 0, ok: true,
+          msg: '巡检发现槽位被僵尸占用,已清理并从断点重新入队',
+        }).catch(() => null);
+        this.logger.warn(`[巡检] 批次 ${bUuid} 已重新入队续跑(EP${batch.cursorEp} 第 ${batch.cursorStep} 步)`);
+      } catch (e: any) {
+        await this.svc.appendBatchLog(bUuid, {
+          ep: Number(batch.cursorEp) || 0, step: Number(batch.cursorStep) || 0, ok: false,
+          msg: `巡检续跑失败:${String(e?.message || e).slice(0, 160)}`,
+        }).catch(() => null);
+      }
+    }
+    return cleaned;
   }
 
   /** 跑一批(幂等:已完成的步骤会被跳过) */
@@ -455,6 +550,8 @@ export class DramaOrchestrator implements OnApplicationBootstrap {
       return { cont: true, degraded: true };
     }
 
+    // 2026-09-22:本段内已重试过的步(每步最多补一次,见下方 catch)
+    const retriedSteps = new Set<number>();
     for (let step = from; step <= to; step++) {
       if (token.cancel) return this.abortSteps(batch, '用户取消');
       if (doneSteps.has(step) && step !== 1) {
@@ -540,6 +637,22 @@ export class DramaOrchestrator implements OnApplicationBootstrap {
           this.progress.emitFailed(batchRoom(batch.uuid),
             `EP${epNo} 第${step + 1}步失败:${msg}`);
           return { cont: false, degraded: false };
+        }
+        // 2026-09-22:分镜(step2)是整集的**源头** —— 它一失败,后面 3/4/5 全无产物,
+        //   该集直接从成片里消失(EP1 实测:一次上游 JSON 截断 → 整集没了)。
+        //   上游截断/偶发超时不值得整集报废,这里对 step2 补一次立即重试。
+        //   ⚠️ 只重试一次:上游真挂了的时候,无限重试会把预算烧光还交不出片。
+        if (step === 2 && !blocking && !retriedSteps.has(step)) {
+          retriedSteps.add(step);
+          this.logger.warn(
+            `批次 ${batch.uuid} EP${epNo} 第2步(分镜)失败,上游偶发 → 立即重试一次:${msg}`,
+          );
+          await this.svc.appendBatchLog(batch.uuid, {
+            ep: epNo, step, ok: true,
+            msg: `第2步失败,自动重试一次:${String(msg).slice(0, 80)}`, credits: 0,
+          }).catch(() => null);
+          step -= 1; // for++ 后回到同一步
+          continue;
         }
         // 非阻断步:该集标降级,本段就此收尾(后面的步依赖这一步的产物)
         await this.svc.markEpisodeDegraded(dramaUuid, epNo, msg).catch(() => null);

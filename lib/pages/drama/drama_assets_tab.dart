@@ -23,6 +23,9 @@ import '../../theme/app_colors.dart';
 import '../../theme/app_text_styles.dart';
 import '../../widgets/optimized_network_image.dart';
 import '../../theme/app_dimens.dart';
+import '../../utils/poll_timer.dart';
+import '../../utils/app_toast.dart';
+import '../../i18n/i18n.dart';
 
 class DramaAssetsTab extends StatefulWidget {
   final String uuid;
@@ -173,7 +176,8 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
   /// running 就 3s 轮一次,终态就停 —— 轮询不停是今天门③ producing 那类假活的成因
   void _syncPolling() {
     if (_batchRunning) {
-      _poll ??= Timer.periodic(const Duration(seconds: 3), (_) => _loadBatch());
+      // 2026-09-20:改用 PollTimer —— 退后台/切标签页时暂停 tick,回前台补一次;底层仍是 Timer.periodic,取消写法不变。
+      _poll ??= PollTimer(const Duration(seconds: 3), (_) => _loadBatch());
     } else {
       _poll?.cancel();
       _poll = null;
@@ -182,7 +186,6 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
 
   /// 一键定妆:POST 立即返回,图在后台逐张落,进度靠轮询
   Future<void> _startBatch() async {
-    final messenger = ScaffoldMessenger.of(context);
     setState(() => _batchBusy = true);
     try {
       final r = _unwrap(await _api.dio
@@ -196,26 +199,18 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
       });
       _syncPolling();
       final total = _batchInt('total');
-      messenger.showSnackBar(SnackBar(
-        content: Text(total == 0
-            ? '所有资产都已定妆,不需要补图'
-            : '已开始定妆 $total 项,可以留在本页看进度,也可以先去别的页'),
-        backgroundColor: AppColors.success,
-      ));
+      AppToast.success(context, total == 0
+            ? tr('drama.assets.auto_001')
+            : tr('drama.assets.auto_002', args: {'total': '$total'}));
       if (total > 0) _loadBatch();
     } catch (e) {
       if (mounted) setState(() => _batchBusy = false);
-      messenger.showSnackBar(SnackBar(
-        content: Text('批量定妆未能启动:${e is DioException ? ApiClient.describeError(e) : e}'),
-        backgroundColor: AppColors.danger,
-        duration: const Duration(seconds: 5),
-      ));
+      AppToast.error(context, tr('drama.assets_tab.t01', args: {'err': '${e is DioException ? ApiClient.describeError(e) : e}'}));
     }
   }
 
   /// 单颗定妆(卡片上的按钮,不用开抽屉)
   Future<void> _portraitOne(Map<String, dynamic> a) async {
-    final messenger = ScaffoldMessenger.of(context);
     final id = '${a['id']}';
     final name = '${a['name'] ?? ''}';
     // 2026-09-16(批4):QC suspect 的资产点「定妆」= force 整套重画 —— 增量复用
@@ -230,15 +225,12 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
         data: {'force': suspect},
         options: Options(receiveTimeout: const Duration(minutes: 15)),
       );
-      messenger.showSnackBar(SnackBar(
-          content: Text('「$name」定妆完成'), backgroundColor: AppColors.success));
+      if (!mounted) return;
+      AppToast.success(context, tr('drama.assets_tab.t02', args: {'name': name}));
     } catch (e) {
       // 失败原因必须读得到(上游 503 / 落地失败 / 已锁定),不能只给"操作失败"
-      messenger.showSnackBar(SnackBar(
-        content: Text('「$name」定妆失败:${e is DioException ? ApiClient.describeError(e) : e}'),
-        backgroundColor: AppColors.danger,
-        duration: const Duration(seconds: 5),
-      ));
+      if (!mounted) return;
+      AppToast.error(context, tr('drama.assets_tab.t03', args: {'name': name, 'err': '${e is DioException ? ApiClient.describeError(e) : e}'}));
     } finally {
       if (mounted) setState(() => _portraitBusy.remove(id));
       await _load();
@@ -246,18 +238,15 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
   }
 
   Future<void> _act(String label, Future<Response> Function() fn) async {
-    final messenger = ScaffoldMessenger.of(context);
     try {
       await fn();
       await _load();
-      messenger.showSnackBar(SnackBar(content: Text('$label 完成'), backgroundColor: AppColors.success));
+      if (!mounted) return;
+      AppToast.success(context, tr('drama.assets_tab.t04', args: {'label': label}));
     } catch (e) {
       // 失败原因必须可读到(例如"有引用不能删"),不能只给一个"操作失败"
-      messenger.showSnackBar(SnackBar(
-        content: Text('$label 失败:${e is DioException ? ApiClient.describeError(e) : e}'),
-        backgroundColor: AppColors.danger,
-        duration: const Duration(seconds: 5),
-      ));
+      if (!mounted) return;
+      AppToast.error(context, tr('drama.assets_tab.t05', args: {'label': label, 'err': '${e is DioException ? ApiClient.describeError(e) : e}'}));
     }
   }
 
@@ -324,7 +313,7 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
               const SizedBox(width: AppSpacing.sm),
               Expanded(
                 child: Text(
-                  running ? '正在批量定妆 $done/$total 项' : '$undressed 项资产还没有定妆图',
+                  running ? tr('drama.assets.auto_003', args: {'done': '$done', 'total': '$total'}) : tr('drama.assets.auto_004', args: {'undressed': '$undressed'}),
                   style: AppTextStyles.bodyMedium
                       .copyWith(color: accent, fontWeight: FontWeight.w800),
                 ),
@@ -349,17 +338,15 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
             const SizedBox(height: AppSpacing.sm),
             Text(
               current.isEmpty
-                  ? '队列推进中…每张图约 10~40 秒。可以留在本页看进度,也可以先去别的页。'
-                  : '当前:「${current['name'] ?? ''}」—— 每张图约 10~40 秒;'
-                      '离开本页再回来进度仍在(状态在后端落库)。',
+                  ? tr('drama.assets.auto_005')
+                  : tr('drama.assets.auto_006', args: {'current': "${current['name'] ?? ''}"}),
               style: AppTextStyles.labelSmall
                   .copyWith(color: AppColors.textSecondary, height: 1.5),
             ),
           ] else ...[
             const SizedBox(height: AppSpacing.sm),
             Text(
-              '定妆图决定角色长相。缺图直接进生产,每集关键帧会退化成纯文生图,'
-              '同一个角色在相邻镜头里可能换脸。角色出四视图、场景道具出单图。',
+              tr('drama.assets.auto_007'),
               style: AppTextStyles.bodySmall
                   .copyWith(color: AppColors.textSecondary, height: 1.55),
             ),
@@ -375,7 +362,7 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
                               strokeWidth: 2, color: Colors.white))
                       : const Icon(Icons.auto_awesome, size: 16),
                   label: Text(
-                      _batchBusy ? '正在启动…' : '一键定妆剩余 $undressed 项'),
+                      _batchBusy ? tr('drama.assets.auto_008') : tr('drama.assets.auto_009', args: {'undressed': '$undressed'})),
                   style: FilledButton.styleFrom(
                     backgroundColor: AppColors.primary,
                     foregroundColor: Colors.white,
@@ -385,7 +372,7 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
                 ),
                 const SizedBox(width: AppSpacing.md),
                 Expanded(
-                  child: Text('也可以点任意卡片上的「定妆」单独出一项',
+                  child: Text(tr('drama.assets_tab.t06'),
                       style: AppTextStyles.labelSmall
                           .copyWith(color: AppColors.textTertiary)),
                 ),
@@ -398,13 +385,13 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
               Padding(
                 padding: const EdgeInsets.only(bottom: AppSpacing.xxs),
                 child: Text(
-                  '· ${f['name'] ?? ''}:${f['error'] ?? '未知原因'}',
+                  tr('drama.assets.auto_010', args: {'f': "${f['name'] ?? ''}", 'error': "${f['error'] ?? tr('novel_drama.unknown_reason')}"}),
                   style: AppTextStyles.labelSmall
                       .copyWith(color: AppColors.danger, height: 1.5),
                 ),
               ),
             if (!running)
-              Text('失败项已计入上方「剩余」,再点一次只补这些,不会重烧已成功的图。',
+              Text(tr('drama.assets_tab.t07'),
                   style: AppTextStyles.labelSmall
                       .copyWith(color: AppColors.textTertiary)),
           ],
@@ -431,7 +418,7 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
                         controller: _search,
                         style: AppTextStyles.bodySmall,
                         decoration: InputDecoration(
-                          hintText: '搜索名称 / slug / 描述',
+                          hintText: tr('drama.assets_tab.t08'),
                           hintStyle: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary),
                           prefixIcon: const Icon(Icons.search, size: 17),
                           isDense: true,
@@ -450,7 +437,7 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
                     onPressed: _openCreateDialog,
                     style: IconButton.styleFrom(backgroundColor: AppColors.primary),
                     icon: const Icon(Icons.add, color: Colors.white, size: 20),
-                    tooltip: '手工新增资产',
+                    tooltip: tr('drama.assets_tab.t09'),
                   ),
                 ],
               ),
@@ -462,7 +449,7 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
                     // 2026-09-16:chip 切换必须重新请求 —— 旧实现只 setState 不 _load,
                     // 分类视图显示什么全取决于"上一次 _load 带的 kind",用户看到
                     // "全部有货、其他全空"的错乱现象(七问题之问题5)。
-                    _chip(label: '全部', on: _kind == null,
+                    _chip(label: tr('common.all'), on: _kind == null,
                         onTap: () { setState(() => _kind = null); _load(); }),
                     ..._kinds.entries.map((e) {
                       final n = _counts[e.key];
@@ -470,7 +457,7 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
                         label: n == null ? e.value : '${e.value} $n',
                         on: _kind == e.key,
                         muted: n == 0,
-                        tooltip: n == 0 ? '本书未涉及该类别' : null,
+                        tooltip: n == 0 ? tr('drama.assets.auto_011') : null,
                         onTap: () { setState(() => _kind = e.key); _load(); },
                       );
                     }),
@@ -537,13 +524,13 @@ class _DramaAssetsTabState extends State<DramaAssetsTab> {
         Center(
           child: Text(
               _kind == null
-                  ? '资产库还是空的'
-                  : ((_counts[_kind] ?? 1) == 0 ? '本书未涉及该类别' : '该类别下暂无资产'),
+                  ? tr('drama.assets.auto_012')
+                  : ((_counts[_kind] ?? 1) == 0 ? tr('drama.assets.auto_013') : tr('drama.assets.auto_014')),
               style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary)),
         ),
         const SizedBox(height: AppSpacing.sm),
         Center(
-          child: Text('角色定妆一次,之后每集都复用\n也可以手工上传参考图当资产',
+          child: Text(tr('drama.assets.auto_015'),
               textAlign: TextAlign.center,
               style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
         ),
@@ -651,7 +638,7 @@ class _AssetCard extends StatelessWidget {
                                   Icon(refs.isEmpty ? Icons.add_a_photo_outlined : Icons.broken_image_rounded,
                                       size: 22, color: AppColors.textTertiary),
                                   const SizedBox(height: AppSpacing.xs),
-                                  Text(refs.isEmpty ? '暂无参考图' : '原图已失效',
+                                  Text(refs.isEmpty ? tr('drama.assets.auto_016') : tr('drama.assets.auto_017'),
                                       style: AppTextStyles.labelSmall.copyWith(
                                           fontSize: 10, color: AppColors.textTertiary)),
                                 ],
@@ -686,8 +673,7 @@ class _AssetCard extends StatelessWidget {
                     borderRadius: BorderRadius.circular(AppColors.tagRadius),
                   ),
                   child: Text(
-                      '质检疑似:${((qc['issues'] as List?) ?? const []).join('; ')}'
-                      ' · 点「定妆」重画',
+                      tr('drama.assets.auto_018', args: {'issues': ((qc['issues'] as List?) ?? const []).join('; ')}),
                       maxLines: 2, overflow: TextOverflow.ellipsis,
                       style: AppTextStyles.labelSmall.copyWith(
                           fontSize: 10, color: AppColors.danger)),
@@ -709,7 +695,7 @@ class _AssetCard extends StatelessWidget {
                       ],
                     ),
                   ),
-                  Text('用 ${(asset['useCount'] as num?)?.toInt() ?? 0}',
+                  Text(tr('drama.assets_tab.t10', args: {'n': "${(asset['useCount'] as num?)?.toInt() ?? 0}"}),
                       maxLines: 1, overflow: TextOverflow.ellipsis,
                       style: AppTextStyles.labelSmall.copyWith(
                           fontSize: 10, color: AppColors.textSecondary)),
@@ -730,7 +716,7 @@ class _AssetCard extends StatelessWidget {
                             child: CircularProgressIndicator(
                                 strokeWidth: 2, color: Colors.white))
                         : const Icon(Icons.auto_awesome, size: 13),
-                    label: Text(portraitBusy ? '定妆中…' : '定妆(出参考图)',
+                    label: Text(portraitBusy ? tr('drama.assets.auto_019') : tr('drama.assets.auto_020'),
                         style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700)),
                     style: FilledButton.styleFrom(
                       backgroundColor: AppColors.warning.withValues(alpha: 0.9),
@@ -815,18 +801,16 @@ class _AssetSheetState extends State<_AssetSheet> {
   }
 
   Future<void> _run(String label, Future<void> Function() fn) async {
-    final messenger = ScaffoldMessenger.of(context);
     setState(() => _busy = true);
     try {
       await fn();
-      messenger.showSnackBar(SnackBar(content: Text('$label 完成'), backgroundColor: AppColors.success));
+      if (!mounted) return;
+      AppToast.success(context, tr('drama.assets_tab.t11', args: {'label': label}));
       widget.onChanged();
       if (mounted) Navigator.pop(context);
     } catch (e) {
-      messenger.showSnackBar(SnackBar(
-        content: Text('$label 失败:${e is DioException ? ApiClient.describeError(e) : e}'),
-        backgroundColor: AppColors.danger, duration: const Duration(seconds: 5),
-      ));
+      if (!mounted) return;
+      AppToast.error(context, tr('drama.assets_tab.t12', args: {'label': label, 'err': '${e is DioException ? ApiClient.describeError(e) : e}'}));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -847,16 +831,15 @@ class _AssetSheetState extends State<_AssetSheet> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: AppColors.surface,
-        title: const Text('整套重画参考图'),
-        content: Text('将重新生成全部 $n 张视图,已经成功的这几张也会重跑一次'
-            '(会再消耗对应积分)。若只是想补上失败的角度,直接关掉用主按钮即可。'),
+        title: Text(tr('drama.assets_tab.t13')),
+        content: Text(tr('drama.assets_tab.t14', args: {'n': '$n'})),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(tr('common.cancel'))),
           ElevatedButton(
             onPressed: () => Navigator.pop(ctx, true),
             style: ElevatedButton.styleFrom(
                 backgroundColor: AppColors.danger, foregroundColor: Colors.white),
-            child: const Text('整套重画'),
+            child: Text(tr('drama.assets_tab.t15')),
           ),
         ],
       ),
@@ -888,7 +871,7 @@ class _AssetSheetState extends State<_AssetSheet> {
                   ),
                   Text('${a['slug'] ?? ''}',
                       style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
-                  IconButton(onPressed: () => Navigator.pop(context), icon: const Icon(Icons.close)),
+                  IconButton(tooltip: tr('common.close'), onPressed: () => Navigator.pop(context), icon: const Icon(Icons.close)),
                 ],
               ),
             ),
@@ -897,7 +880,7 @@ class _AssetSheetState extends State<_AssetSheet> {
                 padding: const EdgeInsets.fromLTRB(AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.xl),
                 children: [
                   if (refs.isNotEmpty) ...[
-                    Text('参考视图(${refs.length})', style: AppTextStyles.labelSmall.copyWith(
+                    Text(tr('drama.assets_tab.t16', args: {'n': '${refs.length}'}), style: AppTextStyles.labelSmall.copyWith(
                         color: AppColors.textSecondary, fontWeight: FontWeight.w600)),
                     const SizedBox(height: AppSpacing.sm),
                     SizedBox(
@@ -942,7 +925,7 @@ class _AssetSheetState extends State<_AssetSheet> {
                                   ),
                                 ),
                                 const SizedBox(height: AppSpacing.xs),
-                                Text(isCanon ? '${r['angle']} · 主参考' : '${r['angle']}',
+                                Text(isCanon ? tr('drama.assets.auto_021', args: {'r': "${r['angle']}"}) : '${r['angle']}',
                                     maxLines: 1, overflow: TextOverflow.ellipsis,
                                     style: AppTextStyles.labelSmall.copyWith(
                                         fontSize: 10,
@@ -954,12 +937,12 @@ class _AssetSheetState extends State<_AssetSheet> {
                       ),
                     ),
                     const SizedBox(height: AppSpacing.sm),
-                    Text('点任一视图设为 canonical —— 后续关键帧的图生图默认拿它当参考。',
+                    Text(tr('drama.assets_tab.t17'),
                         style: AppTextStyles.labelSmall.copyWith(
                              color: AppColors.textTertiary)),
                   ],
                   const SizedBox(height: AppSpacing.lg),
-                  Text('锚定描述(跨集一致性的文字依据)',
+                  Text(tr('drama.assets_tab.t18'),
                       style: AppTextStyles.labelSmall.copyWith(
                           color: AppColors.textSecondary, fontWeight: FontWeight.w600)),
                   const SizedBox(height: AppSpacing.xs),
@@ -978,29 +961,29 @@ class _AssetSheetState extends State<_AssetSheet> {
                   ),
                   if ((a['descPersona'] ?? '').toString().isNotEmpty) ...[
                     const SizedBox(height: AppSpacing.md),
-                    Text('人设 / 用途', style: AppTextStyles.labelSmall.copyWith(
+                    Text(tr('drama.assets_tab.t19'), style: AppTextStyles.labelSmall.copyWith(
                         color: AppColors.textSecondary, fontWeight: FontWeight.w600)),
                     Text('${a['descPersona']}', style: AppTextStyles.bodySmall),
                   ],
                   const SizedBox(height: AppSpacing.md),
                   Row(
                     children: [
-                      Flexible(child: Text('来源 ', style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary), maxLines: 1, overflow: TextOverflow.ellipsis)),
+                      Flexible(child: Text(tr('drama.assets_tab.t20'), style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary), maxLines: 1, overflow: TextOverflow.ellipsis)),
                       Flexible(child: Text('${a['source'] ?? ''}', style: AppTextStyles.labelSmall, maxLines: 1, overflow: TextOverflow.ellipsis)),
                       if (a['sourceEp'] != null) ...[
                         Text(' · EP${a['sourceEp']}', style: AppTextStyles.labelSmall),
                       ],
-                      Flexible(child: Text(' · 引用 ${a['useCount'] ?? 0} 次', style: AppTextStyles.labelSmall, maxLines: 1, overflow: TextOverflow.ellipsis)),
+                      Flexible(child: Text(tr('drama.assets_tab.t21', args: {'n': "${a['useCount'] ?? 0}"}), style: AppTextStyles.labelSmall, maxLines: 1, overflow: TextOverflow.ellipsis)),
                     ],
                   ),
                   if ((a['aliases'] as List?)?.isNotEmpty ?? false) ...[
                     const SizedBox(height: AppSpacing.sm),
-                    Text('别名 ${(a['aliases'] as List).join(' / ')}',
+                    Text(tr('drama.assets_tab.t22', args: {'names': (a['aliases'] as List).join(' / ')}),
                         style: AppTextStyles.labelSmall.copyWith(color: AppColors.textTertiary)),
                   ],
                   if (variants.isNotEmpty) ...[
                     const SizedBox(height: AppSpacing.md),
-                    Text('变体(${variants.length})', style: AppTextStyles.labelSmall.copyWith(
+                    Text(tr('drama.assets_tab.t23', args: {'n': '${variants.length}'}), style: AppTextStyles.labelSmall.copyWith(
                         color: AppColors.textSecondary, fontWeight: FontWeight.w600)),
                     ...variants.map((v) => Padding(
                           padding: const EdgeInsets.only(top: AppSpacing.xs),
@@ -1012,14 +995,12 @@ class _AssetSheetState extends State<_AssetSheet> {
                   ],
                   if (_usage.isNotEmpty) ...[
                     const SizedBox(height: AppSpacing.md),
-                    Text('被这些集引用', style: AppTextStyles.labelSmall.copyWith(
+                    Text(tr('drama.assets_tab.t24'), style: AppTextStyles.labelSmall.copyWith(
                         color: AppColors.textSecondary, fontWeight: FontWeight.w600)),
                     ..._usage.map((u) => Padding(
                           padding: const EdgeInsets.only(top: AppSpacing.xs),
                           child: Text(
-                              '· EP${u['epNo']} ${u['title'] ?? ''}'
-                              '${(u['shotIdxs'] as List?)?.isNotEmpty ?? false ? ' · 镜 ${(u['shotIdxs'] as List).join(',')}' : ''}'
-                              '${(u['variant'] ?? '').toString().isEmpty ? '' : ' · 造型 ${u['variant']}'}',
+                              tr('drama.assets.auto_022', args: {'u': "${u['epNo']}", 'u_2': "${u['title'] ?? ''}", 'shots': ((u['shotIdxs'] as List?)?.isNotEmpty ?? false ? tr('drama.shots_suffix', args: {'list': (u['shotIdxs'] as List).join(',')}) : ''), 'variant': ((u['variant'] ?? '').toString().isEmpty ? '' : tr('drama.variant_suffix', args: {'variant': "${u['variant']}"}))}),
                               style: AppTextStyles.bodySmall),
                         )),
                   ],
@@ -1037,7 +1018,7 @@ class _AssetSheetState extends State<_AssetSheet> {
                         ? const SizedBox(width: AppSpacing.lg, height: AppSpacing.lg,
                             child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
                         : const Icon(Icons.auto_awesome, size: 16),
-                    label: Text(refs.isEmpty ? '生成定妆图' : '补齐缺失视图'),
+                    label: Text(refs.isEmpty ? tr('drama.assets.auto_023') : tr('drama.assets.auto_024')),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: AppColors.primary,
                       foregroundColor: AppColors.surface,
@@ -1049,7 +1030,7 @@ class _AssetSheetState extends State<_AssetSheet> {
                     TextButton.icon(
                       onPressed: _busy ? null : _confirmFullRepaint,
                       icon: const Icon(Icons.refresh_rounded, size: 15),
-                      label: Text('整套重画 ${refs.length} 张(不满意这张脸时用)',
+                      label: Text(tr('drama.assets_tab.t25', args: {'n': '${refs.length}'}),
                           style: AppTextStyles.bodySmall.copyWith(
                                color: AppColors.textSecondary)),
                     ),
@@ -1057,7 +1038,7 @@ class _AssetSheetState extends State<_AssetSheet> {
                   if (a['locked'] == true)
                     Padding(
                       padding: const EdgeInsets.only(top: AppSpacing.xxs),
-                      child: Text('该资产已锁定,需先解锁才能重生成。',
+                      child: Text(tr('drama.assets_tab.t26'),
                           style: AppTextStyles.labelSmall.copyWith(color: AppColors.warning)),
                     ),
                   const SizedBox(height: AppSpacing.sm),
@@ -1068,18 +1049,18 @@ class _AssetSheetState extends State<_AssetSheet> {
                         context: context,
                         builder: (ctx) => AlertDialog(
                           backgroundColor: AppColors.surface,
-                          title: const Text('新增变体(换装/负伤/新时刻)'),
+                          title: Text(tr('drama.assets_tab.t27')),
                           content: TextField(
                             controller: _variant,
                             autofocus: true,
                             style: AppTextStyles.bodySmall,
-                            decoration: const InputDecoration(hintText: '例:婚纱造型 / 雨夜'),
+                            decoration: InputDecoration(hintText: tr('drama.assets_tab.t28')),
                           ),
                           actions: [
-                            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+                            TextButton(onPressed: () => Navigator.pop(ctx), child: Text(tr('common.cancel'))),
                             ElevatedButton(
                               onPressed: () => Navigator.pop(ctx, _variant.text.trim()),
-                              child: const Text('确定'),
+                              child: Text(tr('common.ok')),
                             ),
                           ],
                         ),
@@ -1094,7 +1075,7 @@ class _AssetSheetState extends State<_AssetSheet> {
                       });
                     },
                     icon: const Icon(Icons.style_outlined, size: 16),
-                    label: const Text('加一个变体(而不是新建资产)'),
+                    label: Text(tr('drama.assets_tab.t29')),
                     style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: AppSpacing.md)),
                   ),
                   const SizedBox(height: AppSpacing.sm),
@@ -1112,7 +1093,7 @@ class _AssetSheetState extends State<_AssetSheet> {
                             },
                           ),
                           icon: Icon(locked ? Icons.lock_open : Icons.lock_outline, size: 16),
-                          label: Text(locked ? '解锁' : '锁定'),
+                          label: Text(locked ? tr('drama.assets.auto_025') : tr('drama.assets.auto_026')),
                           style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: AppSpacing.md)),
                         ),
                       ),
@@ -1126,7 +1107,7 @@ class _AssetSheetState extends State<_AssetSheet> {
                                         '/dramas/${widget.uuid}/assets/${a['id']}/confirm');
                                   }),
                           icon: const Icon(Icons.check_circle_outline, size: 16),
-                          label: const Text('确认入库'),
+                          label: Text(tr('drama.assets_tab.t30')),
                           style: OutlinedButton.styleFrom(
                             foregroundColor: AppColors.success,
                             padding: const EdgeInsets.symmetric(vertical: AppSpacing.md),
@@ -1145,7 +1126,7 @@ class _AssetSheetState extends State<_AssetSheet> {
                                 data: {'descVisual': _desc.text.trim()});
                           }),
                           icon: const Icon(Icons.save_outlined, size: 16),
-                          label: const Text('保存'),
+                          label: Text(tr('common.save')),
                           style: ElevatedButton.styleFrom(
                             backgroundColor: AppColors.primary, foregroundColor: AppColors.surface,
                             padding: const EdgeInsets.symmetric(vertical: AppSpacing.md),
@@ -1158,7 +1139,7 @@ class _AssetSheetState extends State<_AssetSheet> {
                           await _api.dio.delete('/dramas/${widget.uuid}/assets/${a['id']}');
                         }),
                         icon: Icon(Icons.delete_outline, color: AppColors.danger),
-                        tooltip: '停用(有引用会被后端拒绝)',
+                        tooltip: tr('drama.assets_tab.t31'),
                       ),
                     ],
                   ),
@@ -1201,10 +1182,8 @@ class _AssetCreateSheetState extends State<_AssetCreateSheet> {
   }
 
   Future<void> _submit() async {
-    final messenger = ScaffoldMessenger.of(context);
     if (_name.text.trim().isEmpty || _desc.text.trim().isEmpty) {
-      messenger.showSnackBar(SnackBar(
-          content: const Text('名称与锚定描述都必填'), backgroundColor: AppColors.danger));
+      AppToast.error(context, tr('drama.assets_tab.t32'));
       return;
     }
     setState(() => _busy = true);
@@ -1219,13 +1198,11 @@ class _AssetCreateSheetState extends State<_AssetCreateSheet> {
       });
       if (mounted) Navigator.pop(context);
       widget.onCreated();
-      messenger.showSnackBar(SnackBar(
-          content: const Text('资产已入库'), backgroundColor: AppColors.success));
+      if (!mounted) return;
+      AppToast.success(context, tr('drama.assets_tab.t33'));
     } catch (e) {
-      messenger.showSnackBar(SnackBar(
-        content: Text('新增失败:${e is DioException ? ApiClient.describeError(e) : e}'),
-        backgroundColor: AppColors.danger, duration: const Duration(seconds: 5),
-      ));
+      if (!mounted) return;
+      AppToast.error(context, tr('drama.assets_tab.t34', args: {'err': '${e is DioException ? ApiClient.describeError(e) : e}'}));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -1243,9 +1220,9 @@ class _AssetCreateSheetState extends State<_AssetCreateSheet> {
           children: [
             Row(
               children: [
-                const Expanded(child: Text('手工新增资产',
-                    style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16))),
-                IconButton(onPressed: () => Navigator.pop(context), icon: const Icon(Icons.close)),
+                Expanded(child: Text(tr('drama.assets_tab.t35'),
+                    style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16))),
+                IconButton(tooltip: tr('common.close'), onPressed: () => Navigator.pop(context), icon: const Icon(Icons.close)),
               ],
             ),
             Wrap(
@@ -1277,7 +1254,7 @@ class _AssetCreateSheetState extends State<_AssetCreateSheet> {
               child: _busy
                   ? const SizedBox(width: AppSpacing.lg, height: AppSpacing.lg,
                       child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                  : const Text('入库'),
+                  : Text(tr('drama.assets_tab.t36')),
             ),
           ],
         ),

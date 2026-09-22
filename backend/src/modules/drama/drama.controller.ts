@@ -584,6 +584,13 @@ export class DramaController {
     return this.novelLedger.getByDrama(BigInt(this.userId(req)), BigInt(drama.id));
   }
 
+  /** 罗列逐集时长计划:能出多少集、每集多长(内容折时 vs 实际生成目标)、总时长 */
+  @Get(':uuid/novel/plan')
+  async getEpisodePlan(@Req() req: Request, @Param('uuid') uuid: string) {
+    const drama = await this.svc.getDrama(uuid);
+    return this.novelLedger.planForDrama(BigInt(this.userId(req)), BigInt(drama.id));
+  }
+
   /** 读账本里的原文全文(入口 B 上传的小说也能读;只读,不给保存)
    *  ⚠️ 必须声明在 /:uuid/novel/ledger 之后、且路径段不同,不会互相吞掉 */
   @Get(':uuid/novel/text')
