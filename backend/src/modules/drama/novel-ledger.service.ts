@@ -12,6 +12,10 @@
 // 账本 JSON 全程经 DB 过手(n2d-core 不直连 MySQL)。P2 若性能有需要再
 // 把 n2d-core 源码 vendor 进 modules/drama/core/(接口签名已对齐,迁移零改)。
 //
+// 2026-09-24:tool/n2d-core 源码丢失,引擎按生产账本标定重建为库内纯函数
+//   (./n2d-engine,原 P2 vendor 路线提前执行),子进程桥接同时下线 ——
+//   少一个构建产物、少 Windows spawn 坑,行为全单测锁定(n2d-engine.spec)。
+//
 // M0/P1 范围:账本 CRUD、ingest(调 n2d-core init)、beats 投影同步、
 //           校验(check:budget/coverage 结果落审计并同步 beats 表)、
 //           审批门状态机、快照记录(时间机器读侧)。
@@ -34,27 +38,14 @@ import {
 import { chapterGoodEndingHints, repackLedgerEpisodes } from './episode-boundary';
 import { planEpisodeBudgets } from './episode-budget';
 import { normalizeLf } from './novel-anchor';
+import { buildLedgerJson, checkLedgerJson } from './n2d-engine';
 import { randomUUID } from 'crypto';
 import * as path from 'path';
 import * as fs from 'fs';
 
-/** n2d-core dist 路径(仓库内绝对定位;CI/部署时随 repo 走)
- *  从 __dirname 逐级上溯找 tool/n2d-core/dist/cli.js,兼容多种编译布局:
- *    nest --watch:backend/dist/src/modules/drama(5 级到根)
- *    nest build:  backend/dist/modules/drama(4 级到根)
- *    ts-node 直跑:backend/src/modules/drama(4 级到根)
- *  上限 8 级,找不到抛错(启动期 fail-fast)。 */
-const N2D_CORE_CLI = (() => {
-  let dir = __dirname;
-  for (let i = 0; i < 8; i++) {
-    const candidate = path.join(dir, 'tool', 'n2d-core', 'dist', 'cli.js');
-    if (fs.existsSync(candidate)) return candidate;
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  throw new Error(`n2d-core CLI not found (searched up from ${__dirname})`);
-})();
+  // ── n2d-core CLI 桥接 ────────────────────────────────────────────────
+  // 2026-09-24:子进程桥接下线(源码丢失后引擎库内化,见 ./n2d-engine)。
+  //   runN2D/resolveN2dCli/exportToTmp 同步删除;两处调用改为库内直调。
 
 /** 校验结果(n2d-core CheckResult 的 JSON 形态) */
 export interface CheckOutcome {
@@ -115,22 +106,9 @@ export class NovelLedgerService implements OnApplicationBootstrap {
     @Optional() private readonly montage?: OpenMontageService,
   ) {}
 
-  // ── n2d-core CLI 桥接 ────────────────────────────────────────────────
-
-  /** 调 n2d-core CLI(唯一桥接点;失败抛 BadRequestException) */
-  private runN2D(args: string[], timeoutMs = 60_000): { stdout: string; stderr: string; code: number } {
-    return (() => {
-      const { spawnSync } = require('child_process') as typeof import('child_process');
-      const node = process.execPath;
-      const r = spawnSync(node, [N2D_CORE_CLI, ...args], {
-        encoding: 'utf-8', timeout: timeoutMs, windowsHide: true,
-      });
-      if (r.error) {
-        throw new BadRequestException(`n2d-core 启动失败:${r.error.message}`);
-      }
-      return { stdout: r.stdout ?? '', stderr: r.stderr ?? '', code: r.status ?? -1 };
-    })();
-  }
+  // ── n2d 对齐引擎(库内直调,见 ./n2d-engine) ─────────────────────────────
+  // 2026-09-24:子进程桥接(runN2D/resolveN2dCli/exportToTmp)下线,两处调用
+  //   (ingest/check)改为库内纯函数直调。删得干净,不留转接层。
 
   // ── 账本 CRUD ────────────────────────────────────────────────────────
 
@@ -158,18 +136,13 @@ export class NovelLedgerService implements OnApplicationBootstrap {
     const novelPath = path.join(novelDir, `${sha}.txt`);
     fs.writeFileSync(novelPath, novelText, 'utf-8');
 
-    // 2. 调 n2d-core init(临时账本 → 读回 JSON)
-    const tmpLedger = path.join(novelDir, `tmp-${randomUUID()}.json`);
-    const r = this.runN2D([
-      'init', novelPath, '--out', tmpLedger,
-      '--title', title, '--source', source, '--ep-target', String(epTargetSec),
-    ]);
-    if (r.code !== 0) {
-      this.logger.error(`n2d init failed: ${r.stderr}`);
-      throw new BadRequestException(`账本生成失败:${r.stdout || r.stderr}`.slice(0, 400));
+    // 2. 对齐引擎建账本(库内直调;原 tool/n2d-core init 子进程已下线,见 ./n2d-engine)
+    let ledgerJson: any;
+    try {
+      ledgerJson = buildLedgerJson({ novelText, title, source, epTargetSec });
+    } catch (e: any) {
+      throw new BadRequestException(`账本生成失败:${e?.message || e}`.slice(0, 400));
     }
-    const ledgerJson = JSON.parse(fs.readFileSync(tmpLedger, 'utf-8'));
-    fs.unlinkSync(tmpLedger);
 
     // 3. 入库(一部剧一份,已存在则拒)
     const exists = await this.prisma.$queryRawUnsafe<{ c: number }[]>(
@@ -311,28 +284,28 @@ export class NovelLedgerService implements OnApplicationBootstrap {
     };
   }
 
-  /** 校验:导出账本 → n2d-core check → 结果写回 audit_trail + 版本号 */
+  /** 校验:库内直调 check → 结果写回 audit_trail + 版本号 */
   async runCheck(
     userId: bigint, dramaId: bigint,
     which: 'budget' | 'coverage', stage = 'ingest',
   ): Promise<CheckOutcome & { ledgerVersion: number }> {
     const ledger = await this.loadLedgerForWrite(userId, dramaId);
-    const tmp = this.exportToTmp(ledger.ledgerJson);
+    const ljRaw = (ledger as any).ledgerJson;
+    const ljParsed: any = typeof ljRaw === 'string'
+      ? (() => { try { return JSON.parse(ljRaw); } catch { return null; } })()
+      : ljRaw;
+    if (!ljParsed || typeof ljParsed !== 'object') {
+      throw new BadRequestException('账本 JSON 损坏,无法校验');
+    }
+    const checked = checkLedgerJson(ljParsed, which, stage);
+    const updated = checked.ledgerJson;
 
-    const args = which === 'budget'
-      ? ['check:budget', tmp]
-      : ['check:coverage', tmp, '--stage', stage];
-    const r = this.runN2D(args);
-    // check 失败(存在 error 级违规)退出码 2 —— 但结果 JSON 仍要从账本读回
-    const updated = JSON.parse(fs.readFileSync(tmp, 'utf-8'));
-    fs.unlinkSync(tmp);
-
-    // 结果写回 DB(账本 JSON 已被 n2d-core 更新:audit_trail + version)
+    // 结果写回 DB(账本 JSON 已被 check 更新:audit_trail + version)
     const outcome: CheckOutcome = {
       checker: which === 'budget' ? 'check_budget' : 'check_coverage',
       stage: which === 'budget' ? 'ingest' : stage,
-      passed: r.code === 0,
-      violations: (updated.audit_trail[updated.audit_trail.length - 1]?.violations ?? [])
+      passed: !checked.failed,
+      violations: (((updated.audit_trail[updated.audit_trail.length - 1] as any)?.violations ?? []) as string[])
         .map((line: string) => this.parseAuditLine(line)),
     };
     await this.prisma.$queryRawUnsafe(
@@ -977,13 +950,6 @@ export class NovelLedgerService implements OnApplicationBootstrap {
     );
     if (!rows.length) throw new NotFoundException('该剧没有对齐账本');
     return rows[0];
-  }
-
-  /** 账本 JSON 导出临时文件(n2d-core 的输入形态) */
-  private exportToTmp(ledgerJson: unknown): string {
-    const tmp = path.join(require('os').tmpdir(), `n2d-${randomUUID()}.json`);
-    fs.writeFileSync(tmp, JSON.stringify(ledgerJson), 'utf-8');
-    return tmp;
   }
 
   /** audit_trail 行解析回 Violation 形态(含 userMessage 翻译) */
