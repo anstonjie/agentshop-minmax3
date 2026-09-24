@@ -27,6 +27,7 @@ import '../theme/app_colors.dart';
 import '../theme/app_text_styles.dart';
 import '../theme/app_dimens.dart';
 import '../../i18n/i18n.dart';
+import 'brand_button.dart';
 export 'workbench_studio.dart';
 
 // ─── 表单字段容器:统一 label + 描述 + 控件的纵向节奏 ──────────────────────
@@ -57,7 +58,8 @@ class WbField extends StatelessWidget {
               style: AppTextStyles.labelLarge.copyWith(
                 color: AppColors.textPrimary,
                 fontWeight: FontWeight.w700,
-                letterSpacing: 0.1,
+                // 2026-09-22:中文禁止 letterSpacing
+                letterSpacing: 0,
               ),
               maxLines: 1, overflow: TextOverflow.ellipsis)),
             if (required) ...[
@@ -266,22 +268,11 @@ class _InputShellState extends State<_InputShell> {
                 : AppColors.border,
             width: _focused ? 1.2 : 0.8,
           ),
+          // 2026-09-22 PR-3:阴影走 AppShadow 令牌(PR-2 起焦点阴影已收敛为
+          // 中性墨色,彩色辉光只留 ctaGlow 15%)
           boxShadow: _focused
-              ? [
-                  BoxShadow(
-                    color: AppColors.primary.withValues(alpha: 0.08),
-                    blurRadius: 12,
-                    offset: const Offset(0, 3),
-                  ),
-                ]
-              : [
-                  BoxShadow(
-                    color: AppColors.ink
-                        .withValues(alpha: 0.03),
-                    blurRadius: 6,
-                    offset: const Offset(0, 2),
-                  ),
-                ],
+              ? AppShadow.s2(alpha: 0.08)
+              : AppShadow.s1(alpha: 0.03),
         ),
         padding: widget.padding,
         child: widget.child,
@@ -501,14 +492,8 @@ class _WbChip extends StatelessWidget {
               width: 0.8,
             ),
             boxShadow: selected
-                ? [
-                    BoxShadow(
-                      color: AppColors.ctaGlow
-                          .withValues(alpha: 0.30),
-                      blurRadius: 10,
-                      offset: const Offset(0, 3),
-                    ),
-                  ]
+                // 2026-09-22 PR-3:选中态辉光走 AppShadow.glow(glow 军规内建)
+                ? AppShadow.glow(blur: 10, offset: const Offset(0, 3))
                 : null,
           ),
           child: Row(
@@ -528,7 +513,7 @@ class _WbChip extends StatelessWidget {
                 label,
                 style: AppTextStyles.labelLarge.copyWith(color: selected
                       ? AppColors.ctaForeground
-                      : AppColors.textPrimary, letterSpacing: 0.1),
+                      : AppColors.textPrimary, letterSpacing: 0),
                       maxLines: 1, overflow: TextOverflow.ellipsis)),
               if (selected) ...[
                 const SizedBox(width: AppSpacing.xs),
@@ -619,9 +604,10 @@ class WbSlider extends StatelessWidget {
             ),
             child: Text(
               text,
+              // 数字走等宽字阶;formatValue 可能拼中文单位,伪粗统一 w700
               style: AppTextStyles.numberSmall.copyWith(
                 color: AppColors.primary,
-                fontWeight: FontWeight.w800,
+                fontWeight: FontWeight.w700,
               ),
             ),
           ),
@@ -673,9 +659,9 @@ class WbUploadZone extends StatelessWidget {
                   ? AppColors.border
                   : AppColors.primary.withValues(alpha: 0.4),
               width: fileName == null ? 1 : 1.2,
-              style: fileName == null
-                  ? BorderStyle.solid
-                  : BorderStyle.solid,
+              // 2026-09-22:Flutter 的 BorderStyle 只有 solid/none,无 dashed;
+              // 虚线占位视觉需 CustomPainter 才能实现,暂统一实线(空态弱色、已选高亮)。
+              style: BorderStyle.solid,
             ),
           ),
           child: fileName == null
@@ -685,16 +671,9 @@ class WbUploadZone extends StatelessWidget {
                       width: 40,
                       height: 40,
                       decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          colors: [
-                            AppColors.primary
-                                .withValues(alpha: 0.15),
-                            AppColors.ctaGlow
-                                .withValues(alpha: 0.08),
-                          ],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                        ),
+                        // 2026-09-22 PR-2:装饰性双色渐变收敛(渐变只留主 CTA / 选中态),
+                        // 图标底改为同色系纯色淡底。
+                        color: AppColors.primary.withValues(alpha: 0.12),
                         borderRadius: BorderRadius.circular(AppColors.cardRadius),
                       ),
                       child: Icon(icon,
@@ -775,8 +754,12 @@ class WbUploadZone extends StatelessWidget {
   }
 }
 
-// ─── 主提交按钮(渐变 + 光晕 + loading 态) ──────────────────────────────────
+// ─── 主提交按钮(2026-09-22 PR-3 收编到 BrandButton:全站唯一主 CTA) ─────────
 
+/// 工作台主提交按钮 —— 主 CTA 收编:自绘渐变按钮(Material + InkWell +
+/// 自拼 ctaGradient / 辉光 / loading)一律改为全站唯一主按钮 [BrandButton]
+/// (自带按压缩放 / 水波纹 / busy 转圈 / 防重复点击 / 辉光军规内建)。
+/// 调用方 API 保持不变,视觉语言与全站主 CTA 对齐。
 class WbSubmitButton extends StatelessWidget {
   final String label;
   final String? loadingLabel;
@@ -797,67 +780,13 @@ class WbSubmitButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final active = !disabled && !loading && onTap != null;
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: active ? onTap : null,
-        borderRadius: BorderRadius.circular(AppColors.cardRadius),
-        child: AnimatedOpacity(
-          duration: const Duration(milliseconds: 180),
-          opacity: active ? 1 : 0.55,
-          child: Container(
-            height: 54,
-            decoration: BoxDecoration(
-              gradient: AppColors.ctaGradient,
-              borderRadius: BorderRadius.circular(AppColors.cardRadius),
-              boxShadow: [
-                BoxShadow(
-                  color: AppColors.ctaGlow.withValues(alpha: 0.35),
-                  blurRadius: 18,
-                  offset: const Offset(0, 8),
-                ),
-              ],
-            ),
-            child: Center(
-              child: loading
-                  ? Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        SizedBox(
-                          width: AppSpacing.xl,
-                          height: AppSpacing.xl,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2.4,
-                            color: AppColors.ctaForeground,
-                          ),
-                        ),
-                        const SizedBox(width: AppSpacing.md),
-                        Flexible(child: Text(
-                          loadingLabel ?? tr('paywall.processing'),
-                          style: AppTextStyles.titleMedium.copyWith(color: AppColors.ctaForeground, letterSpacing: 0.5, fontWeight: FontWeight.w700),
-                          maxLines: 1, overflow: TextOverflow.ellipsis)),
-                      ],
-                    )
-                  : Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (icon != null) ...[
-                          Icon(icon,
-                              color: AppColors.ctaForeground,
-                              size: 18),
-                          const SizedBox(width: AppSpacing.sm),
-                        ],
-                        Flexible(child: Text(
-                          label,
-                          style: AppTextStyles.titleMedium.copyWith(color: AppColors.ctaForeground, letterSpacing: 0.5, fontWeight: FontWeight.w800),
-                          maxLines: 1, overflow: TextOverflow.ellipsis)),
-                      ],
-                    ),
-            ),
-          ),
-        ),
-      ),
+    return BrandButton(
+      text: label,
+      busyText: loadingLabel ?? tr('paywall.processing'),
+      icon: icon,
+      busy: loading,
+      enabled: !disabled,
+      onPressed: onTap,
     );
   }
 }
@@ -882,14 +811,8 @@ class WbInfoCard extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(AppSpacing.lg),
       decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [
-            c.withValues(alpha: 0.08),
-            c.withValues(alpha: 0.03),
-          ],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
+        // 2026-09-22 PR-2:装饰性淡色渐变收敛为纯色淡底(渐变只留主 CTA / 选中态)
+        color: c.withValues(alpha: 0.06),
         borderRadius: BorderRadius.circular(AppColors.cardRadius),
         border: Border.all(color: c.withValues(alpha: 0.20)),
       ),
@@ -1000,13 +923,8 @@ class WbCard extends StatelessWidget {
         color: color ?? AppColors.cardBg,
         borderRadius: BorderRadius.circular(AppColors.cardRadius),
         border: Border.all(color: AppColors.border, width: 0.6),
-        boxShadow: [
-          BoxShadow(
-            color: AppColors.ink.withValues(alpha: 0.04),
-            blurRadius: 20,
-            offset: const Offset(0, 8),
-          ),
-        ],
+        // 2026-09-22 PR-3:卡片投影走 AppShadow.s3 令牌(墨色 / blur 16)
+        boxShadow: AppShadow.s3(alpha: 0.04),
       ),
       child: child,
     );

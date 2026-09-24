@@ -44,6 +44,13 @@ import '../theme/app_dimens.dart';
 import '../utils/poll_timer.dart';
 import '../utils/app_toast.dart';
 import '../i18n/i18n.dart';
+// PR-4 三铁律装配:UsageArtifact(剧场产物模型)/ BrandButton(唯一主 CTA)
+// / SkeletonList(骨架屏)/ WbStepAccordion(三大分幕手风琴)/ WorkbenchTheater(产物剧场)
+import '../models/usage_artifact.dart';
+import '../widgets/brand_button.dart';
+import '../widgets/skeleton.dart';
+import '../widgets/wb_step_accordion.dart';
+import '../widgets/workbench_theater.dart';
 
 class NovelDramaWorkbenchPage extends StatefulWidget {
   /// 发起新生成 / 新建剧时用得到;按 dramaUuid 恢复旧项目时可以为 0。
@@ -1024,58 +1031,119 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             icon: const Icon(Icons.movie_filter_rounded),
           ),
         ],
-        bottom: hasLedger
-            ? null
-            : TabBar(
-                controller: _tabs,
-                labelColor: AppColors.primary,
-                unselectedLabelColor: AppColors.textSecondary,
-                indicatorColor: AppColors.primary,
-                tabs: [
-                  Tab(icon: const Icon(Icons.auto_awesome_rounded, size: 18),
-                      text: tr('novel_drama.tab_ai_novel')),
-                  Tab(icon: const Icon(Icons.menu_book_rounded, size: 18),
-                      text: tr('novel_drama.tab_my_novel')),
-                ],
-              ),
+        bottom: hasLedger ? null : _buildConstrainedTabBar(),
       ),
       body: _restoring
-          ? const Center(child: CircularProgressIndicator())
+          // 页面级加载态改骨架屏(DESIGN 五.3:彻底废除整页菊花转圈)
+          ? const SingleChildScrollView(child: SkeletonList(count: 3))
           : hasLedger
               ? _buildLedgerView()
-              : Column(
-                  children: [
-                    const SizedBox(height: AppSpacing.md),
-                    WbInfoCard(
-                      icon: Icons.auto_stories_rounded,
-                      text:
-                          tr('novel_drama.hero_body'),
-                    ),
-                    const SizedBox(height: AppSpacing.sm),
-                    // 2026-09-15:未完成项目清单。放在 TabBarView 之外,
-                    // 两个 Tab 都能看到 —— 断点续跑不该取决于你停在哪个入口。
-                    // (不能塞进 SingleChildScrollView:TabBarView 要的是有界高度)
-                    _buildActiveProjectsCard(),
-                    Expanded(
-                      child: TabBarView(
-                        controller: _tabs,
-                        children: [
-                          _buildGenTab(),
-                          _buildUploadTab(),
-                        ],
+              // WbFormBody:宽屏(桌面浏览器)收窄到可读列宽并居中 ——
+              // 本页此前没有这层约束,1900px 下 Tab 拉满两端、卡片通栏,观感极廉价。
+              : WbFormBody(
+                  child: Column(
+                    children: [
+                      const SizedBox(height: AppSpacing.md),
+                      _buildHeroCard(),
+                      // 2026-09-15:未完成项目清单。放在 TabBarView 之外,
+                      // 两个 Tab 都能看到 —— 断点续跑不该取决于你停在哪个入口。
+                      // (不能塞进 SingleChildScrollView:TabBarView 要的是有界高度)
+                      _buildActiveProjectsCard(),
+                      Expanded(
+                        child: TabBarView(
+                          controller: _tabs,
+                          children: [
+                            _buildGenTab(),
+                            _buildUploadTab(),
+                          ],
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
+    );
+  }
+
+  /// AppBar 底部 Tab:宽屏下收进居中窄列(≤480)。
+  /// 默认 TabBar 会铺满整个 AppBar —— 桌面浏览器里两个 Tab 被甩到屏幕两端,
+  /// 中间空出一大片,是本页「不像精品」的第一眼来源。
+  /// indicatorSize.label 让下划线只贴文字宽度,比通栏细线更精致。
+  PreferredSize _buildConstrainedTabBar() {
+    final tabBar = TabBar(
+      controller: _tabs,
+      labelColor: AppColors.primary,
+      unselectedLabelColor: AppColors.textSecondary,
+      indicatorColor: AppColors.primary,
+      indicatorWeight: 2.5,
+      indicatorSize: TabBarIndicatorSize.label,
+      dividerColor: AppColors.divider,
+      tabs: [
+        Tab(icon: const Icon(Icons.auto_awesome_rounded, size: 18),
+            text: tr('novel_drama.tab_ai_novel')),
+        Tab(icon: const Icon(Icons.menu_book_rounded, size: 18),
+            text: tr('novel_drama.tab_my_novel')),
+      ],
+    );
+    return PreferredSize(
+      preferredSize: tabBar.preferredSize,
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 480),
+          child: tabBar,
+        ),
+      ),
+    );
+  }
+
+  /// Hero 介绍条:图标底片 + 正文,替换原先通栏的 WbInfoCard 灰条。
+  /// 卡片语言与下方列表/手风琴对齐(surface + 细描边 + s2 投影),
+  /// 左侧图标用 primary 10% 淡底(渐变只留主 CTA,不做装饰性双色)。
+  Widget _buildHeroCard() {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(
+          AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.md),
+      padding: const EdgeInsets.all(AppSpacing.xl),
+      decoration: BoxDecoration(
+        color: AppColors.cardBg,
+        borderRadius: BorderRadius.circular(AppColors.cardRadius),
+        border: Border.all(color: AppColors.borderLight),
+        boxShadow: AppShadow.s2(alpha: 0.05),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              color: AppColors.primary.withValues(alpha: 0.10),
+              borderRadius: BorderRadius.circular(AppColors.slotRadius),
+            ),
+            child:
+                Icon(Icons.auto_stories_rounded, size: 22, color: AppColors.primary),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          Expanded(
+            child: Text(
+              tr('novel_drama.hero_body'),
+              style: AppTextStyles.bodyMedium
+                  .copyWith(color: AppColors.textSecondary, height: 1.65),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
   // ── 未完成项目清单(2026-09-15 断点续跑) ───────────────────────────────
 
-  static const _gateNames = {
-    'gate1_budget': '① 报价单',
-    'gate2_design': '② 角色场景设定',
-    'gate3_script': '③ 分集剧本',
+  // PR-2 i18n:机器 key 不动、展示值走 tr();tr 非 const,包 tr 后 const 改
+  // static final(惰性求值,首次访问在 build 期,彼时 i18n 已 init,先例见
+  // whiteboard_workbench_page 的 static final preset 表)
+  static final Map<String, String> _gateNames = {
+    'gate1_budget': tr('novel_drama.gate_name_1'),
+    'gate2_design': tr('novel_drama.gate_name_2'),
+    'gate3_script': tr('novel_drama.gate_name_3'),
   };
 
   String _gateNameOf(String? gate) => _gateNames[gate] ?? tr('novel_drama.gate_name_producing');
@@ -1122,19 +1190,31 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     final shown = _activeProjects.take(3).toList();
     final totalCount = _activeProjects.length + paused.length;
     return Container(
-      margin: const EdgeInsets.fromLTRB(AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.sm),
-      padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.sm),
+      margin: const EdgeInsets.fromLTRB(
+          AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.sm),
+      padding: const EdgeInsets.fromLTRB(
+          AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.xs),
       decoration: BoxDecoration(
         color: AppColors.cardBg,
         borderRadius: BorderRadius.circular(AppColors.cardRadius),
-        border: Border.all(color: AppColors.primary.withValues(alpha: 0.3)),
+        border: Border.all(color: AppColors.borderLight),
+        boxShadow: AppShadow.s2(alpha: 0.05),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(
             children: [
-              Icon(Icons.history_rounded, size: 18, color: AppColors.primary),
+              Container(
+                width: 32,
+                height: 32,
+                decoration: BoxDecoration(
+                  color: AppColors.primary.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(AppColors.slotRadius),
+                ),
+                child: Icon(Icons.history_rounded,
+                    size: 16, color: AppColors.primary),
+              ),
               const SizedBox(width: AppSpacing.sm),
               Expanded(
                 child: Text(tr('novel_drama.active_projects_title', args: {'n': '$totalCount'}),
@@ -1143,17 +1223,27 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             ],
           ),
           const SizedBox(height: AppSpacing.xs),
-          Text(
-            tr('novel_drama.active_projects_subtitle'),
-            style: AppTextStyles.caption
-                .copyWith(color: AppColors.textSecondary),
+          Padding(
+            padding: const EdgeInsets.only(left: 40),
+            child: Text(
+              tr('novel_drama.active_projects_subtitle'),
+              style: AppTextStyles.caption
+                  .copyWith(color: AppColors.textTertiary, height: 1.5),
+            ),
           ),
-          const SizedBox(height: AppSpacing.sm),
-          for (final p in shown) _activeProjectRow(p),
-          for (final t in paused) _pausedGenRow(t),
+          const SizedBox(height: AppSpacing.xs),
+          for (final p in shown) ...[
+            Divider(height: 1, thickness: 0.5, color: AppColors.divider),
+            _activeProjectRow(p),
+          ],
+          for (final t in paused) ...[
+            Divider(height: 1, thickness: 0.5, color: AppColors.divider),
+            _pausedGenRow(t),
+          ],
           if (_activeProjects.length > shown.length)
             Padding(
-              padding: const EdgeInsets.fromLTRB(AppSpacing.xxs, AppSpacing.xxs, 0, AppSpacing.sm),
+              padding: const EdgeInsets.fromLTRB(
+                  AppSpacing.xxs, AppSpacing.sm, 0, AppSpacing.sm),
               child: Text(
                 tr('novel_drama.active_projects_more', args: {'n': '${_activeProjects.length - shown.length}'}),
                 style: AppTextStyles.caption
@@ -1173,19 +1263,31 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     final failed = t['status'] == 'failed';
     final chDone = t['chaptersDone'] ?? 0;
     final chTotal = t['chaptersTotal'] ?? 0;
+    final accent = failed ? AppColors.danger : AppColors.warning;
     return InkWell(
       borderRadius: BorderRadius.circular(AppColors.slotRadius),
       onTap: () => setState(() => _genTask = Map<String, dynamic>.from(t)),
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(AppSpacing.xxs, AppSpacing.sm, AppSpacing.xxs, AppSpacing.sm),
+        padding: const EdgeInsets.fromLTRB(
+            AppSpacing.xs, AppSpacing.md, AppSpacing.xs, AppSpacing.md),
         child: Row(
           children: [
-            Icon(
-              failed ? Icons.error_outline_rounded : Icons.pause_circle_outline_rounded,
-              size: 18,
-              color: failed ? AppColors.danger : AppColors.textSecondary,
+            Container(
+              width: 32,
+              height: 32,
+              decoration: BoxDecoration(
+                color: accent.withValues(alpha: 0.10),
+                borderRadius: BorderRadius.circular(AppColors.slotRadius),
+              ),
+              child: Icon(
+                failed
+                    ? Icons.error_outline_rounded
+                    : Icons.pause_circle_outline_rounded,
+                size: 16,
+                color: accent,
+              ),
             ),
-            const SizedBox(width: AppSpacing.sm),
+            const SizedBox(width: AppSpacing.md),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1203,7 +1305,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: AppTextStyles.caption
-                        .copyWith(color: AppColors.textSecondary),
+                        .copyWith(color: accent),
                   ),
                 ],
               ),
@@ -1219,13 +1321,41 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     final dramaUuid = p['dramaUuid']?.toString() ?? '';
     final chars = _asInt(p['totalChars']) ?? 0;
     final eps = _asInt(p['episodeCount']) ?? 0;
+    // 状态语义色:失败/驳回 → danger,生产/生成 → primary,等待确认 → warning
+    final reason = p['reason']?.toString() ?? '';
+    final accent = switch (reason) {
+      'failed' || 'rejected' => AppColors.danger,
+      'stopped' => AppColors.warning,
+      'generating' || 'producing' => AppColors.primary,
+      'waiting' => AppColors.warning,
+      _ => AppColors.textTertiary,
+    };
+    final icon = switch (reason) {
+      'failed' || 'rejected' => Icons.error_outline_rounded,
+      'stopped' => Icons.pause_circle_outline_rounded,
+      'generating' => Icons.auto_awesome_rounded,
+      'producing' => Icons.movie_filter_rounded,
+      'waiting' => Icons.schedule_rounded,
+      _ => Icons.folder_open_rounded,
+    };
     return InkWell(
       borderRadius: BorderRadius.circular(AppColors.slotRadius),
       onTap: () => _openProject(dramaUuid),
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(AppSpacing.xxs, AppSpacing.sm, AppSpacing.xxs, AppSpacing.sm),
+        padding: const EdgeInsets.fromLTRB(
+            AppSpacing.xs, AppSpacing.md, AppSpacing.xs, AppSpacing.md),
         child: Row(
           children: [
+            Container(
+              width: 32,
+              height: 32,
+              decoration: BoxDecoration(
+                color: accent.withValues(alpha: 0.10),
+                borderRadius: BorderRadius.circular(AppColors.slotRadius),
+              ),
+              child: Icon(icon, size: 16, color: accent),
+            ),
+            const SizedBox(width: AppSpacing.md),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1252,8 +1382,9 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             ),
             const SizedBox(width: AppSpacing.sm),
             Text(tr('novel_drama.continue_btn'),
+                // 中文文案伪粗 w800 → w700(PR-2 字重军规)
                 style: AppTextStyles.caption.copyWith(
-                    color: AppColors.primary, fontWeight: FontWeight.w800)),
+                    color: AppColors.primary, fontWeight: FontWeight.w700)),
             const SizedBox(width: AppSpacing.xxs),
             Icon(Icons.arrow_forward_ios,
                 size: 10, color: AppColors.primary),
@@ -1273,70 +1404,52 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           if (task == null || !running) ...[
-            WbTextField(
-              label: tr('novel_drama.novel_title_label'),
-              hint: tr('novel_drama.novel_title_hint'),
-              controller: _genTitleCtrl,
-              icon: Icons.drive_file_rename_outline_rounded,
-              required: true,
-            ),
-            const SizedBox(height: AppSpacing.md),
-            WbTextField(
-              label: tr('novel_drama.genre_label'),
-              hint: tr('novel_drama.genre_hint'),
-              controller: TextEditingController(text: _genGenre),
-              icon: Icons.category_rounded,
-              onChanged: (v) => _genGenre = v.trim(),
-            ),
-            const SizedBox(height: AppSpacing.md),
-            WbDropdown<String>(
-              label: tr('novel_drama.scale_label'),
-              value: _tier,
-              items: [
-                WbDropdownItem(
-                    value: 'demo', label: tr('novel_drama.scale_demo')),
-                WbDropdownItem(
-                    value: 'novella', label: tr('novel_drama.scale_novella')),
-                WbDropdownItem(
-                    value: 'full', label: tr('novel_drama.scale_full')),
+            // ════════════════════════════════════════════════════════════
+            // 三大分幕手风琴(DESIGN §四.4 铁律一,PR-4 装配):
+            //   幕1 核心输入 = 小说标题
+            //   幕2 制作设定 = 小说规模档位 + 每集目标时长
+            //   幕3 高级微调 = 题材(选填)+ 开跑前预估卡(低频参数收第 3 幕)
+            // 一次只开一幕的展开语义由 WbStepAccordion 保证,此处不自写;
+            // 错误卡 / 扣费横幅 / 主 CTA / 提示语留在手风琴**之外**(下方)。
+            // ════════════════════════════════════════════════════════════
+            WbStepAccordion(
+              sections: [
+                WbStepSection(
+                  title: tr('novel_drama.act_core_title'),
+                  subtitle: tr('novel_drama.act_gen_core_sub'),
+                  content: _buildGenActCore(),
+                ),
+                WbStepSection(
+                  title: tr('novel_drama.act_make_title'),
+                  subtitle: tr('novel_drama.act_gen_make_sub'),
+                  content: _buildGenActMake(),
+                ),
+                WbStepSection(
+                  title: tr('novel_drama.act_advanced_title'),
+                  subtitle: tr('novel_drama.act_gen_advanced_sub'),
+                  content: _buildGenActAdvanced(),
+                ),
               ],
-              onChanged: (v) => setState(() => _tier = v),
-              icon: Icons.library_books_rounded,
             ),
-            const SizedBox(height: AppSpacing.md),
-            WbDropdown<String>(
-              label: tr('novel_drama.ep_target_label'),
-              value: _epTarget,
-              items: [
-                WbDropdownItem(value: '60', label: tr('novel_drama.ep_60')),
-                WbDropdownItem(value: '90', label: tr('novel_drama.ep_90')),
-                WbDropdownItem(value: '120', label: tr('novel_drama.ep_120')),
-                WbDropdownItem(value: '180', label: tr('novel_drama.ep_180')),
-              ],
-              onChanged: (v) => setState(() => _epTarget = v),
-              icon: Icons.timer_outlined,
-            ),
-            const SizedBox(height: AppSpacing.md),
-            // 入口 A 的字数是档位目标值(小说还没生成,拿不到实数)
-            _buildEstimateCard(_tierChars[_tier] ?? 20000, _epTarget),
-            const SizedBox(height: AppSpacing.md),
             if (_error != null) ...[
+              const SizedBox(height: AppSpacing.md),
               WbInfoCard(
                 icon: Icons.error_outline_rounded,
                 text: _error!,
                 accent: AppColors.danger,
               ),
-              const SizedBox(height: AppSpacing.md),
             ],
+            const SizedBox(height: AppSpacing.md),
             AgentCostBanner.compact(agentId: widget.agentId),
             const SizedBox(height: AppSpacing.md),
-            WbSubmitButton(
-              label: tr('novel_drama.gen_btn'),
-              loadingLabel: tr('novel_drama.gen_btn_loading'),
+            // 主 CTA 收编 BrandButton(全站唯一主按钮,DESIGN 组件唯一性裁决)
+            BrandButton(
+              text: tr('novel_drama.gen_btn'),
+              busyText: tr('novel_drama.gen_btn_loading'),
               icon: Icons.auto_awesome_rounded,
-              loading: _genStarting,
-              disabled: _genStarting,
-              onTap: _startGen,
+              busy: _genStarting,
+              enabled: !_genStarting,
+              onPressed: _startGen,
             ),
             const SizedBox(height: AppSpacing.sm),
             Text(
@@ -1351,6 +1464,75 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     );
   }
 
+  /// 入口 A 幕1「核心输入」:小说标题(必填,唯一的核心输入)
+  Widget _buildGenActCore() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        WbTextField(
+          label: tr('novel_drama.novel_title_label'),
+          hint: tr('novel_drama.novel_title_hint'),
+          controller: _genTitleCtrl,
+          icon: Icons.drive_file_rename_outline_rounded,
+          required: true,
+        ),
+      ],
+    );
+  }
+
+  /// 入口 A 幕2「制作设定」:小说规模档位 + 每集目标时长
+  Widget _buildGenActMake() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        WbDropdown<String>(
+          label: tr('novel_drama.scale_label'),
+          value: _tier,
+          items: [
+            WbDropdownItem(value: 'demo', label: tr('novel_drama.scale_demo')),
+            WbDropdownItem(
+                value: 'novella', label: tr('novel_drama.scale_novella')),
+            WbDropdownItem(value: 'full', label: tr('novel_drama.scale_full')),
+          ],
+          onChanged: (v) => setState(() => _tier = v),
+          icon: Icons.library_books_rounded,
+        ),
+        const SizedBox(height: AppSpacing.md),
+        WbDropdown<String>(
+          label: tr('novel_drama.ep_target_label'),
+          value: _epTarget,
+          items: [
+            WbDropdownItem(value: '60', label: tr('novel_drama.ep_60')),
+            WbDropdownItem(value: '90', label: tr('novel_drama.ep_90')),
+            WbDropdownItem(value: '120', label: tr('novel_drama.ep_120')),
+            WbDropdownItem(value: '180', label: tr('novel_drama.ep_180')),
+          ],
+          onChanged: (v) => setState(() => _epTarget = v),
+          icon: Icons.timer_outlined,
+        ),
+      ],
+    );
+  }
+
+  /// 入口 A 幕3「高级微调」:题材(选填)+ 开跑前预估卡(低频参数收第 3 幕)
+  Widget _buildGenActAdvanced() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        WbTextField(
+          label: tr('novel_drama.genre_label'),
+          hint: tr('novel_drama.genre_hint'),
+          controller: TextEditingController(text: _genGenre),
+          icon: Icons.category_rounded,
+          onChanged: (v) => _genGenre = v.trim(),
+        ),
+        const SizedBox(height: AppSpacing.md),
+        // 入口 A 的字数是档位目标值(小说还没生成,拿不到实数)
+        _buildEstimateCard(_tierChars[_tier] ?? 20000, _epTarget),
+      ],
+    );
+  }
+
   Widget _buildGenProgress(Map<String, dynamic> task) {
     final stage =
         task['stageLabel']?.toString() ?? task['stage']?.toString() ?? '';
@@ -1360,6 +1542,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     final chars = task['charsDone'] ?? 0;
     final preview = task['preview']?.toString();
     final failed = task['status'] == 'failed';
+    final accent = failed ? AppColors.danger : AppColors.primary;
 
     return Container(
       margin: const EdgeInsets.only(top: AppSpacing.md),
@@ -1370,54 +1553,126 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         border: Border.all(
             color: failed
                 ? AppColors.danger.withValues(alpha: 0.4)
-                : AppColors.primary.withValues(alpha: 0.25)),
+                : AppColors.borderLight),
+        boxShadow: AppShadow.s2(alpha: 0.05),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Icon(
-                  failed
-                      ? Icons.error_outline_rounded
-                      : Icons.auto_awesome_rounded,
-                  size: 20,
-                  color: failed ? AppColors.danger : AppColors.primary),
-              const SizedBox(width: AppSpacing.sm),
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: accent.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(AppColors.slotRadius),
+                ),
+                child: Icon(
+                    failed
+                        ? Icons.error_outline_rounded
+                        : Icons.auto_awesome_rounded,
+                    size: 18,
+                    color: accent),
+              ),
+              const SizedBox(width: AppSpacing.md),
               Expanded(
                 child: Text(
                   failed ? tr('novel_drama.gen_failed') : tr('novel_drama.gen_running', args: {'title': '${task['title']}'}),
                   style: AppTextStyles.titleSmall,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
-              Text('$percent%',
-                  style: AppTextStyles.titleSmall.copyWith(
-                      color: AppColors.primary,
-                      fontWeight: FontWeight.w900)),
+              // 百分比读数 → 等宽胶囊(数字军规;胶囊化后与标题视觉分离)
+              Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+                decoration: BoxDecoration(
+                  color: accent.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(AppRadius.pill),
+                ),
+                child: Text('$percent%',
+                    style: AppTextStyles.numberSmall.copyWith(
+                        color: accent, fontWeight: FontWeight.w700)),
+              ),
             ],
           ),
-          const SizedBox(height: AppSpacing.md),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(AppColors.thumbRadius),
-            child: LinearProgressIndicator(
-              value: percent / 100,
-              minHeight: 8,
-              backgroundColor: AppColors.surfaceLight,
-              color: failed ? AppColors.danger : AppColors.primary,
+          const SizedBox(height: AppSpacing.lg),
+          // 进度条:发光只走 AppShadow.glow(ctaGlow 15% / blur≤16,DESIGN 五.6)
+          // 运行中才有微光,失败态保持平铺红色,不给错误态上妆。
+          Container(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(AppRadius.bar),
+              boxShadow: failed
+                  ? null
+                  : AppShadow.glow(
+                      alpha: 0.15,
+                      blur: 12,
+                      offset: const Offset(0, 2),
+                    ),
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(AppRadius.bar),
+              child: LinearProgressIndicator(
+                value: percent / 100,
+                minHeight: 8,
+                backgroundColor: AppColors.surfaceLight,
+                color: accent,
+              ),
             ),
           ),
           const SizedBox(height: AppSpacing.md),
-          Text(
-            tr('novel_drama.gen_progress', args: {'stage': stage, 'done': '$chDone', 'total': '$chTotal', 'chars': '$chars'}),
-            style: AppTextStyles.bodySmall
-                .copyWith(color: AppColors.textSecondary),
+          // 阶段 + 章节 + 字数:阶段走标签胶囊,数字读数单独等宽,不再挤成一句话
+          Row(
+            children: [
+              if (stage.isNotEmpty) ...[
+                Flexible(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: AppSpacing.sm, vertical: AppSpacing.xxs),
+                    decoration: BoxDecoration(
+                      color: AppColors.surfaceLight,
+                      borderRadius: BorderRadius.circular(AppRadius.pill),
+                      border: Border.all(color: AppColors.divider, width: 0.5),
+                    ),
+                    child: Text(
+                      stage,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: AppTextStyles.labelSmall
+                          .copyWith(color: AppColors.textSecondary),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: AppSpacing.sm),
+              ],
+              Text(
+                tr('novel_drama.gen_progress', args: {'stage': '', 'done': '$chDone', 'total': '$chTotal', 'chars': '$chars'})
+                    .replaceFirst(RegExp(r'^\s*·\s*'), '')
+                    .replaceFirst(RegExp(r'^\s*'), ''),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: AppTextStyles.caption
+                    .copyWith(color: AppColors.textTertiary),
+              ),
+            ],
           ),
           if (task['bible']?['logline'] != null) ...[
-            const SizedBox(height: AppSpacing.sm),
-            Text(
-              '${task['bible']['logline']}',
-              style: AppTextStyles.bodySmall
-                  .copyWith(color: AppColors.textPrimary),
+            const SizedBox(height: AppSpacing.md),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(AppSpacing.md),
+              decoration: BoxDecoration(
+                color: AppColors.surfaceLight,
+                borderRadius: BorderRadius.circular(AppColors.slotRadius),
+                border: Border.all(color: AppColors.divider, width: 0.5),
+              ),
+              child: Text(
+                '${task['bible']['logline']}',
+                style: AppTextStyles.bodySmall
+                    .copyWith(color: AppColors.textSecondary, height: 1.6),
+              ),
             ),
           ],
           if (preview != null && preview.isNotEmpty) ...[
@@ -1431,9 +1686,16 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(tr('novel_drama.preview_btn'),
-                      style: AppTextStyles.labelSmall
-                          .copyWith(color: AppColors.textTertiary)),
+                  Row(
+                    children: [
+                      Icon(Icons.menu_book_rounded,
+                          size: 13, color: AppColors.textTertiary),
+                      const SizedBox(width: AppSpacing.xs),
+                      Text(tr('novel_drama.preview_btn'),
+                          style: AppTextStyles.labelSmall
+                              .copyWith(color: AppColors.textTertiary)),
+                    ],
+                  ),
                   const SizedBox(height: AppSpacing.sm),
                   Text(preview,
                       maxLines: 6,
@@ -1447,7 +1709,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           // 2026-09-14:全文入口 —— 生成中/失败/完成都能读(正文逐章 append,
           //   不用等 100%)。阅读器里可切 Markdown 排版 / TXT 原文、改正文、下载。
           if (task['uuid'] != null) ...[
-            const SizedBox(height: AppSpacing.md),
+            const SizedBox(height: AppSpacing.lg),
             WbSubmitButton(
               label: tr('novel_drama.read_full_btn'),
               icon: Icons.menu_book_rounded,
@@ -1531,112 +1793,166 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
   }
 
   // ── 入口 B:粘贴/上传 Tab ─────────────────────────────────────────────
+  // 三大分幕手风琴(DESIGN §四.4 铁律一,PR-4 装配):
+  //   幕1 核心输入 = 作品名 + 小说正文(粘贴/上传/字数)
+  //   幕2 制作设定 = 每集目标时长
+  //   幕3 高级微调 = 开跑前预估卡
   Widget _buildUploadTab() {
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.sm, AppSpacing.lg, AppSpacing.xxl),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          WbTextField(
-            label: tr('novel_drama.work_name_label'),
-            hint: tr('novel_drama.novel_title_hint'),
-            controller: _titleCtrl,
-            icon: Icons.drive_file_rename_outline_rounded,
-            required: true,
-          ),
-          const SizedBox(height: AppSpacing.md),
-          WbTextArea(
-            label: tr('novel_drama.novel_text_label'),
-            hint: tr('novel_drama.novel_text_hint'),
-            controller: _novelCtrl,
-            maxLines: 8,
-            required: true,
-            // 让「N 字」计数与下面的开跑前预估随输入实时更新
-            onChanged: (_) => setState(() {}),
-          ),
-          const SizedBox(height: AppSpacing.sm),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              // Flexible(loose) + spaceBetween 与原来的「按钮 + Spacer + 计数」
-              // 完全等价(按钮贴左、计数贴右),但窄屏时计数会省略而不是撑破。
-              Flexible(
-                child: TextButton.icon(
-                  onPressed: _pickNovelFile,
-                  icon: const Icon(Icons.upload_file_rounded, size: 18),
-                  label: Text(tr('novel_drama.upload_txt')),
-                ),
+          WbStepAccordion(
+            sections: [
+              WbStepSection(
+                title: tr('novel_drama.act_core_title'),
+                subtitle: tr('novel_drama.act_ingest_core_sub'),
+                content: _buildUploadActCore(),
               ),
-              Text(
-                tr('novel_drama.chars_unit', args: {'n': '${_novelCtrl.text.length}'}),
-                maxLines: 1, overflow: TextOverflow.ellipsis,
-                style: AppTextStyles.labelSmall
-                    .copyWith(color: AppColors.textTertiary),
+              WbStepSection(
+                title: tr('novel_drama.act_make_title'),
+                subtitle: tr('novel_drama.act_ingest_make_sub'),
+                content: _buildUploadActMake(),
+              ),
+              WbStepSection(
+                title: tr('novel_drama.act_advanced_title'),
+                subtitle: tr('novel_drama.act_ingest_advanced_sub'),
+                content: _buildUploadActAdvanced(),
               ),
             ],
           ),
-          const SizedBox(height: AppSpacing.md),
-          WbDropdown<String>(
-            label: tr('novel_drama.ep_target_label'),
-            value: _epTarget,
-            items: [
-              WbDropdownItem(value: '60', label: tr('novel_drama.ep_60')),
-              WbDropdownItem(value: '90', label: tr('novel_drama.ep_90')),
-              WbDropdownItem(value: '120', label: tr('novel_drama.ep_120')),
-              WbDropdownItem(value: '180', label: tr('novel_drama.ep_180')),
-            ],
-            onChanged: (v) => setState(() => _epTarget = v),
-            icon: Icons.timer_outlined,
-          ),
-          const SizedBox(height: AppSpacing.md),
-          // 入口 B 的字数是粘贴框里的真实字数,预估直接用它
-          _buildEstimateCard(_novelCtrl.text.length, _epTarget),
-          const SizedBox(height: AppSpacing.md),
+          // 错误卡 / 扣费横幅 / 主 CTA 留在手风琴之外(下方)
           if (_error != null) ...[
+            const SizedBox(height: AppSpacing.md),
             WbInfoCard(
               icon: Icons.error_outline_rounded,
               text: _error!,
               accent: AppColors.danger,
             ),
-            const SizedBox(height: AppSpacing.md),
           ],
+          const SizedBox(height: AppSpacing.md),
           AgentCostBanner.compact(agentId: widget.agentId),
           const SizedBox(height: AppSpacing.md),
-          WbSubmitButton(
-            label: tr('novel_drama.ingest_btn'),
-            loadingLabel: tr('novel_drama.ingest_loading'),
+          // 主 CTA 收编 BrandButton(全站唯一主按钮,DESIGN 组件唯一性裁决)
+          BrandButton(
+            text: tr('novel_drama.ingest_btn'),
+            busyText: tr('novel_drama.ingest_loading'),
             icon: Icons.auto_awesome_rounded,
-            loading: _submitting,
-            disabled: _submitting,
-            onTap: _submit,
+            busy: _submitting,
+            enabled: !_submitting,
+            onPressed: _submit,
           ),
         ],
       ),
     );
   }
 
+  /// 入口 B 幕1「核心输入」:作品名 + 小说正文(粘贴/上传/实时字数)
+  Widget _buildUploadActCore() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        WbTextField(
+          label: tr('novel_drama.work_name_label'),
+          hint: tr('novel_drama.novel_title_hint'),
+          controller: _titleCtrl,
+          icon: Icons.drive_file_rename_outline_rounded,
+          required: true,
+        ),
+        const SizedBox(height: AppSpacing.md),
+        WbTextArea(
+          label: tr('novel_drama.novel_text_label'),
+          hint: tr('novel_drama.novel_text_hint'),
+          controller: _novelCtrl,
+          maxLines: 8,
+          required: true,
+          // 让「N 字」计数与下面的开跑前预估随输入实时更新
+          onChanged: (_) => setState(() {}),
+        ),
+        const SizedBox(height: AppSpacing.sm),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            // Flexible(loose) + spaceBetween 与原来的「按钮 + Spacer + 计数」
+            // 完全等价(按钮贴左、计数贴右),但窄屏时计数会省略而不是撑破。
+            // 次级文字操作(上传 .txt)按取舍保留 TextButton.icon,报告已注明。
+            Flexible(
+              child: TextButton.icon(
+                onPressed: _pickNovelFile,
+                icon: const Icon(Icons.upload_file_rounded, size: 18),
+                label: Text(tr('novel_drama.upload_txt')),
+              ),
+            ),
+            Text(
+              tr('novel_drama.chars_unit', args: {'n': '${_novelCtrl.text.length}'}),
+              maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: AppTextStyles.labelSmall
+                  .copyWith(color: AppColors.textTertiary),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// 入口 B 幕2「制作设定」:每集目标时长
+  Widget _buildUploadActMake() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        WbDropdown<String>(
+          label: tr('novel_drama.ep_target_label'),
+          value: _epTarget,
+          items: [
+            WbDropdownItem(value: '60', label: tr('novel_drama.ep_60')),
+            WbDropdownItem(value: '90', label: tr('novel_drama.ep_90')),
+            WbDropdownItem(value: '120', label: tr('novel_drama.ep_120')),
+            WbDropdownItem(value: '180', label: tr('novel_drama.ep_180')),
+          ],
+          onChanged: (v) => setState(() => _epTarget = v),
+          icon: Icons.timer_outlined,
+        ),
+      ],
+    );
+  }
+
+  /// 入口 B 幕3「高级微调」:开跑前预估卡(低频信息收第 3 幕)
+  Widget _buildUploadActAdvanced() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // 入口 B 的字数是粘贴框里的真实字数,预估直接用它
+        _buildEstimateCard(_novelCtrl.text.length, _epTarget),
+      ],
+    );
+  }
+
   // ── 账本视图(两入口汇合后共用) ────────────────────────────────────────
   Widget _buildLedgerView() {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(AppSpacing.lg),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // 2026-09-15:能恢复就得能退出。以前「离开页面再重进」是回到起始表单的
-          // 唯一途径,现在重进会被自动恢复抢掉 —— 必须给一个显式重置入口。
-          _buildBackToStartRow(),
-          const SizedBox(height: AppSpacing.md),
-          // 2026-09-14:小说原文入口 —— 页面切到账本/报价单视图后,生成卡片连同
-          //   它的「阅读全文」按钮一起消失,完本的小说就再也读不到了。这里补一个
-          //   常驻入口,走账本快照接口(只读),入口 A(生成)和入口 B(上传)都覆盖。
-          _buildNovelSourceCard(),
-          const SizedBox(height: AppSpacing.lg),
-          _buildQuoteCard(),
-          const SizedBox(height: AppSpacing.lg),
-          _buildGatesPanel(),
-          const SizedBox(height: AppSpacing.lg),
-          _buildActionsBar(),
-        ],
+    // 宽屏同样收进可读列宽(与起始页 WbFormBody 同一约束)
+    return WbFormBody(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(AppSpacing.lg),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // 2026-09-15:能恢复就得能退出。以前「离开页面再重进」是回到起始表单的
+            // 唯一途径,现在重进会被自动恢复抢掉 —— 必须给一个显式重置入口。
+            _buildBackToStartRow(),
+            const SizedBox(height: AppSpacing.md),
+            // 2026-09-14:小说原文入口 —— 页面切到账本/报价单视图后,生成卡片连同
+            //   它的「阅读全文」按钮一起消失,完本的小说就再也读不到了。这里补一个
+            //   常驻入口,走账本快照接口(只读),入口 A(生成)和入口 B(上传)都覆盖。
+            _buildNovelSourceCard(),
+            const SizedBox(height: AppSpacing.lg),
+            _buildQuoteCard(),
+            const SizedBox(height: AppSpacing.lg),
+            _buildGatesPanel(),
+            const SizedBox(height: AppSpacing.lg),
+            _buildActionsBar(),
+          ],
+        ),
       ),
     );
   }
@@ -1714,23 +2030,30 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
   }
 
   Widget _buildBackToStartRow() {
+    // 次级动作:描边胶囊,与门内「驳回/重试」的次级语义一致(非主 CTA)
     return Align(
       alignment: Alignment.centerLeft,
       child: InkWell(
-        borderRadius: BorderRadius.circular(AppColors.cardRadius),
+        borderRadius: BorderRadius.circular(AppRadius.pill),
         onTap: _backToStartWithChoice,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+        child: Container(
+          padding: const EdgeInsets.symmetric(
+              horizontal: AppSpacing.md, vertical: AppSpacing.xs),
+          decoration: BoxDecoration(
+            color: AppColors.surfaceLight,
+            borderRadius: BorderRadius.circular(AppRadius.pill),
+            border: Border.all(color: AppColors.divider, width: 0.5),
+          ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(Icons.add_circle_outline_rounded,
-                  size: 15, color: AppColors.textTertiary),
+                  size: 15, color: AppColors.textSecondary),
               const SizedBox(width: AppSpacing.xs),
               Text(
                 tr('novel_drama.new_project_cta'),
-                style: AppTextStyles.caption
-                    .copyWith(color: AppColors.textTertiary),
+                style: AppTextStyles.labelSmall
+                    .copyWith(color: AppColors.textSecondary),
               ),
             ],
           ),
@@ -1749,20 +2072,22 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     final uploaded = source == 'uploaded';
     final hasText = (_ledger?['novelStorageKey']?.toString() ?? '').isNotEmpty;
 
+    // 卡壳与起始页/Hero 同一规范:细描边 + s2,语义只落在图标底片,不再整圈彩边
     return Container(
       padding: const EdgeInsets.all(AppSpacing.xl),
       decoration: BoxDecoration(
         color: AppColors.cardBg,
         borderRadius: BorderRadius.circular(AppColors.cardRadius),
-        border: Border.all(color: AppColors.info.withValues(alpha: 0.25)),
+        border: Border.all(color: AppColors.borderLight),
+        boxShadow: AppShadow.s2(alpha: 0.05),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Icon(Icons.menu_book_rounded, color: AppColors.info, size: 20),
-              const SizedBox(width: AppSpacing.sm),
+              _headerPlate(Icons.menu_book_rounded, color: AppColors.info),
+              const SizedBox(width: AppSpacing.md),
               Expanded(
                 child: Text(
                   title == null || title.isEmpty ? tr('novel_drama.novel_original') : title,
@@ -1771,17 +2096,18 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
+              // 徽章克制:全卡只此 1 枚(来源)
               Container(
                 padding:
                     const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
                 decoration: BoxDecoration(
                   color: AppColors.info.withValues(alpha: 0.10),
-                  borderRadius: BorderRadius.circular(AppColors.cardRadius),
+                  borderRadius: BorderRadius.circular(AppRadius.pill),
                 ),
                 child: Text(
                   uploaded ? tr('novel_drama.source_uploaded') : tr('novel_drama.source_ai'),
                   style: AppTextStyles.labelSmall
-                      .copyWith(color: AppColors.info),
+                      .copyWith(color: AppColors.info, fontWeight: FontWeight.w600),
                 ),
               ),
             ],
@@ -1947,18 +2273,17 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       decoration: BoxDecoration(
         color: AppColors.cardBg,
         borderRadius: BorderRadius.circular(AppColors.cardRadius),
-        border: Border.all(color: AppColors.primary.withValues(alpha: 0.25)),
+        border: Border.all(color: AppColors.borderLight),
+        boxShadow: AppShadow.s2(alpha: 0.05),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Icon(Icons.fact_check_outlined,
-                  color: AppColors.primary, size: 20),
-              const SizedBox(width: AppSpacing.sm),
+              _headerPlate(Icons.fact_check_outlined, color: AppColors.primary),
+              const SizedBox(width: AppSpacing.md),
               Expanded(child: Text(tr('novel_drama.gate1_title'), style: AppTextStyles.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis)),
-              const Spacer(),
               if (status != null) _GateStatusChip(status: status),
             ],
           ),
@@ -2131,8 +2456,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                       raised
                           ? tr('novel_drama.plan_raised')
                           : tr('novel_drama.plan_capped'),
-                      style: AppTextStyles.labelSmall.copyWith(
-                          fontSize: 10,
+                      // 10px 内联字阶 → AppTextStyles.caption(PR-2)
+                      style: AppTextStyles.caption.copyWith(
                           color: raised ? AppColors.warning : AppColors.accent),
                     ),
                 ],
@@ -2162,21 +2487,24 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       decoration: BoxDecoration(
         color: AppColors.cardBg,
         borderRadius: BorderRadius.circular(AppColors.cardRadius),
-        border: Border.all(color: AppColors.border),
+        border: Border.all(color: AppColors.borderLight),
+        boxShadow: AppShadow.s2(alpha: 0.05),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Icon(Icons.account_tree_rounded,
-                  color: AppColors.primary, size: 20),
-              const SizedBox(width: AppSpacing.sm),
+              _headerPlate(Icons.account_tree_rounded, color: AppColors.primary),
+              const SizedBox(width: AppSpacing.md),
               Flexible(child: Text(tr('novel_drama.pipeline_title'), style: AppTextStyles.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis)),
             ],
           ),
-          const SizedBox(height: AppSpacing.md),
-          ...gates.map((g) {
+          const SizedBox(height: AppSpacing.lg),
+          // 竖向步进器:圆点 + 连接线,比裸列表更能表达「审批流水线」
+          ...gates.asMap().entries.map((entry) {
+            final g = entry.value;
+            final index = entry.key;
             final gate = g['gate']?.toString() ?? '';
             final status = g['status']?.toString() ?? 'waiting';
             final label = switch (gate) {
@@ -2185,15 +2513,44 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               'gate3_script' => tr('novel_drama.pipeline_gate3'),
               _ => gate,
             };
-            return Padding(
-              padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+            final isLast = index == gates.length - 1;
+            final lineColor = status == 'passed'
+                ? AppColors.success.withValues(alpha: 0.35)
+                : AppColors.divider;
+            return IntrinsicHeight(
               child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  _GateStatusDot(status: status),
+                  Column(
+                    children: [
+                      const SizedBox(height: AppSpacing.xs),
+                      _GateStatusDot(status: status),
+                      if (!isLast) ...[
+                        const SizedBox(height: AppSpacing.xxs),
+                        Expanded(
+                          // 细连接线:不加圆角,避免写死数字半径撞圆角令牌军规
+                          child: Container(width: 2, color: lineColor),
+                        ),
+                        const SizedBox(height: AppSpacing.xxs),
+                      ] else
+                        const SizedBox(height: AppSpacing.xs),
+                    ],
+                  ),
                   const SizedBox(width: AppSpacing.md),
                   Expanded(
-                      child: Text(label, style: AppTextStyles.bodyMedium)),
-                  _GateStatusChip(status: status),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                          vertical: AppSpacing.xs),
+                      child: Row(
+                        children: [
+                          Expanded(
+                              child: Text(label,
+                                  style: AppTextStyles.bodyMedium)),
+                          _GateStatusChip(status: status),
+                        ],
+                      ),
+                    ),
+                  ),
                 ],
               ),
             );
@@ -2206,6 +2563,19 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           ),
         ],
       ),
+    );
+  }
+
+  /// 卡片头像底片 —— 与 Hero / 项目列表 / 进度卡同一语义色 10% 淡底 + slot 圆角
+  Widget _headerPlate(IconData icon, {required Color color, double size = 36}) {
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(AppColors.slotRadius),
+      ),
+      child: Icon(icon, size: size * 0.5, color: color),
     );
   }
 
@@ -2241,28 +2611,30 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             ),
             const SizedBox(height: AppSpacing.md),
           ],
+          // 主确认收编 BrandButton(主渐变);同排「驳回」降为 BrandButton.outlined,
+          // 一屏一个视觉焦点(CTA 聚焦铁律)。
           Row(
             children: [
               Expanded(
-                child: WbSubmitButton(
-                  label: tr('novel_drama.reject_quote'),
-                  loadingLabel: tr('novel_drama.submitting'),
+                child: BrandButton.outlined(
+                  text: tr('novel_drama.reject_quote'),
+                  busyText: tr('novel_drama.submitting'),
                   icon: Icons.close_rounded,
-                  loading: _deciding,
-                  disabled: _deciding || repacking,
-                  onTap: () => _decideGate('gate1_budget', false),
+                  busy: _deciding,
+                  enabled: !_deciding && !repacking,
+                  onPressed: () => _decideGate('gate1_budget', false),
                 ),
               ),
               const SizedBox(width: AppSpacing.md),
               Expanded(
                 flex: 2,
-                child: WbSubmitButton(
-                  label: tr('novel_drama.confirm_quote_btn'),
-                  loadingLabel: tr('novel_drama.submitting'),
+                child: BrandButton(
+                  text: tr('novel_drama.confirm_quote_btn'),
+                  busyText: tr('novel_drama.submitting'),
                   icon: Icons.check_rounded,
-                  loading: _deciding,
-                  disabled: _deciding || repacking,
-                  onTap: () => _decideGate('gate1_budget', true),
+                  busy: _deciding,
+                  enabled: !_deciding && !repacking,
+                  onPressed: () => _decideGate('gate1_budget', true),
                 ),
               ),
             ],
@@ -2322,13 +2694,14 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           const SizedBox(width: AppSpacing.md),
           Expanded(
             flex: 2,
-            child: WbSubmitButton(
-              label: tr('novel_drama.confirm_design_btn'),
-              loadingLabel: tr('novel_drama.submitting'),
+            // 主确认收编 BrandButton(主渐变);左侧「驳回」保留 _GateMiniButton(次级小按钮)
+            child: BrandButton(
+              text: tr('novel_drama.confirm_design_btn'),
+              busyText: tr('novel_drama.submitting'),
               icon: Icons.check_rounded,
-              loading: _deciding,
-              disabled: _deciding,
-              onTap: _confirmGate2,
+              busy: _deciding,
+              enabled: !_deciding,
+              onPressed: _confirmGate2,
             ),
           ),
         ],
@@ -2421,13 +2794,14 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           const SizedBox(width: AppSpacing.md),
           Expanded(
             flex: 2,
-            child: WbSubmitButton(
-              label: tr('novel_drama.confirm_script_btn'),
-              loadingLabel: tr('novel_drama.submitting'),
+            // 主确认收编 BrandButton(主渐变);左侧「驳回」保留 _GateMiniButton(次级小按钮)
+            child: BrandButton(
+              text: tr('novel_drama.confirm_script_btn'),
+              busyText: tr('novel_drama.submitting'),
               icon: Icons.movie_filter_outlined,
-              loading: _deciding,
-              disabled: _deciding,
-              onTap: () => _decideGate('gate3_script', true),
+              busy: _deciding,
+              enabled: !_deciding,
+              onPressed: () => _decideGate('gate3_script', true),
             ),
           ),
         ],
@@ -2489,7 +2863,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     final uuid = _dramaUuid;
     if (uuid == null) return;
     setState(() => _supplementingEp = epNo);
-    _toast('正在补做第 $epNo 集缺失镜头并重合成，请稍候…');
+    _toast(tr('novel_drama.toast_supplementing', args: {'ep': '$epNo'}));
     try {
       // 步骤 4 视频增量补做
       await _api.dio.post(
@@ -2503,10 +2877,13 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         data: const {},
         options: Options(receiveTimeout: const Duration(minutes: 10)),
       );
-      _toast('第 $epNo 集缺失镜头补做完成，成片已更新！');
+      _toast(tr('novel_drama.toast_supplement_done', args: {'ep': '$epNo'}));
       await _loadEpisodes();
     } catch (e) {
-      if (mounted) _toast('补做失败: ${_errMsg(e)}', error: true);
+      if (mounted) {
+        _toast(tr('novel_drama.toast_supplement_fail', args: {'reason': _errMsg(e)}),
+            error: true);
+      }
     } finally {
       if (mounted) setState(() => _supplementingEp = null);
     }
@@ -2541,7 +2918,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     }
 
     if (items.isEmpty) {
-      _toast('本集暂无台词可微调', error: true);
+      _toast(tr('novel_drama.toast_no_dialogue'), error: true);
       return;
     }
 
@@ -2554,7 +2931,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           children: [
             Icon(Icons.subtitles_outlined, color: AppColors.primary, size: 20),
             const SizedBox(width: AppSpacing.sm),
-            Text('微调第 $epNo 集字幕台词', style: AppTextStyles.titleSmall),
+            Text(tr('novel_drama.reburn_dialog_title', args: {'ep': '$epNo'}),
+                style: AppTextStyles.titleSmall),
           ],
         ),
         content: SizedBox(
@@ -2564,7 +2942,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                '修改后点击「立即重烧」，系统将直接复用视频在 5 秒内烧录新字幕，零视频配额消耗。',
+                tr('novel_drama.reburn_dialog_desc'),
                 style: AppTextStyles.caption.copyWith(color: AppColors.textSecondary),
               ),
               const SizedBox(height: AppSpacing.md),
@@ -2583,7 +2961,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                             color: AppColors.surfaceLight,
                             borderRadius: BorderRadius.circular(AppRadius.bar),
                           ),
-                          child: Text('镜 ${it['shotIdx']}', style: AppTextStyles.labelSmall),
+                          child: Text(tr('novel_drama.shot_chip', args: {'n': '${it['shotIdx']}'}), style: AppTextStyles.labelSmall),
                         ),
                         const SizedBox(width: AppSpacing.sm),
                         Expanded(
@@ -2609,10 +2987,13 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(tr('common.cancel'))),
-          FilledButton.icon(
+          // 主确认收编 BrandButton(全站唯一主按钮,DESIGN 组件唯一性裁决):
+          // 原生 FilledButton 不再当 CTA 用
+          BrandButton.medium(
+            text: tr('novel_drama.reburn_btn'),
+            icon: Icons.bolt_rounded,
+            expanded: false,
             onPressed: () => Navigator.pop(ctx, true),
-            icon: const Icon(Icons.bolt_rounded, size: 16),
-            label: const Text('立即重烧字幕 (5秒)'),
           ),
         ],
       ),
@@ -2637,7 +3018,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     }
 
     setState(() => _reburningEp = epNo);
-    _toast('正在重烧第 $epNo 集字幕…');
+    _toast(tr('novel_drama.toast_reburning', args: {'ep': '$epNo'}));
     try {
       final resp = await _api.dio.post(
         '/dramas/$_dramaUuid/episodes/$epNo/subtitles/reburn',
@@ -2646,11 +3027,14 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
       );
       final data = _unwrap(resp);
       _toast(data is Map && data['needsRealign'] == true
-          ? '字幕已重烧进成片；字数变化超阈值，精确对齐需重跑分镜'
-          : '第 $epNo 集字幕已成功重烧！');
+          ? tr('novel_drama.toast_reburn_realign')
+          : tr('novel_drama.toast_reburn_done', args: {'ep': '$epNo'}));
       await _loadEpisodes();
     } catch (e) {
-      if (mounted) _toast('重烧失败: ${_errMsg(e)}', error: true);
+      if (mounted) {
+        _toast(tr('novel_drama.toast_reburn_fail', args: {'reason': _errMsg(e)}),
+            error: true);
+      }
     } finally {
       if (mounted) setState(() => _reburningEp = null);
     }
@@ -2669,7 +3053,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                 child: CircularProgressIndicator(strokeWidth: 1.8, color: AppColors.primary),
               ),
               const SizedBox(width: AppSpacing.sm),
-              Text('正在读取各集制作明细…', style: AppTextStyles.caption.copyWith(color: AppColors.textTertiary)),
+              Text(tr('novel_drama.episodes_loading'), style: AppTextStyles.caption.copyWith(color: AppColors.textTertiary)),
             ],
           ),
         );
@@ -2685,14 +3069,14 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             Icon(Icons.video_library_outlined, size: 16, color: AppColors.primary),
             const SizedBox(width: AppSpacing.sm),
             Text(
-              '各集分镜明细与操作 (${_episodes.length} 集)',
+              tr('novel_drama.episodes_breakdown_title', args: {'n': '${_episodes.length}'}),
               style: AppTextStyles.labelSmall.copyWith(color: AppColors.textSecondary, fontWeight: FontWeight.w700),
             ),
             const Spacer(),
             TextButton.icon(
               onPressed: () => setState(() => _episodesExpanded = !_episodesExpanded),
               icon: Icon(_episodesExpanded ? Icons.expand_less_rounded : Icons.expand_more_rounded, size: 16),
-              label: Text(_episodesExpanded ? '收起' : '展开明细', style: AppTextStyles.caption),
+              label: Text(_episodesExpanded ? tr('common.collapse') : tr('novel_drama.expand_details_btn'), style: AppTextStyles.caption),
             ),
           ],
         ),
@@ -2706,7 +3090,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
 
   Widget _buildEpisodeItemCard(Map<String, dynamic> ep) {
     final epNo = (ep['epNo'] as num?)?.toInt() ?? 1;
-    final title = ep['title']?.toString() ?? '第 $epNo 集';
+    final title = ep['title']?.toString() ?? tr('novel_drama.ep_fallback_title', args: {'n': '$epNo'});
     final sd = (ep['stepData'] as Map?)?.cast<String, dynamic>() ?? const {};
     final out5 = (sd['5'] as Map?)?['output'] as Map?;
     final out2 = (sd['2'] as Map?)?['output'] as Map?;
@@ -2757,7 +3141,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                   color: AppColors.primary.withValues(alpha: 0.12),
                   borderRadius: BorderRadius.circular(AppRadius.bar),
                 ),
-                child: Text('EP$epNo', style: AppTextStyles.labelSmall.copyWith(color: AppColors.primary, fontWeight: FontWeight.w800)),
+                // 集号读数 → numberSmall 等宽(数字军规);英文编号读数按豁免保留加重
+                child: Text('EP$epNo', style: AppTextStyles.numberSmall.copyWith(color: AppColors.primary, fontWeight: FontWeight.w800)),
               ),
               const SizedBox(width: AppSpacing.sm),
               Expanded(
@@ -2770,8 +3155,9 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               ),
               if (durationSec > 0)
                 Text(
-                  '${durationSec.toStringAsFixed(0)}秒 · $shotCount镜',
-                  style: AppTextStyles.caption.copyWith(color: AppColors.textSecondary),
+                  tr('novel_drama.ep_duration_shots', args: {'sec': durationSec.toStringAsFixed(0), 'shots': '$shotCount'}),
+                  // 时长/镜数读数 → numberSmall 等宽(数字军规)
+                  style: AppTextStyles.numberSmall.copyWith(color: AppColors.textSecondary),
                 ),
               if (missingShots > 0) ...[
                 const SizedBox(width: AppSpacing.sm),
@@ -2781,7 +3167,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                     color: AppColors.danger.withValues(alpha: 0.12),
                     borderRadius: BorderRadius.circular(AppRadius.bar),
                   ),
-                  child: Text('缺 $missingShots 镜', style: AppTextStyles.caption.copyWith(color: AppColors.danger, fontWeight: FontWeight.w700)),
+                  child: Text(tr('novel_drama.missing_shots_badge', args: {'n': '$missingShots'}), style: AppTextStyles.caption.copyWith(color: AppColors.danger, fontWeight: FontWeight.w700)),
                 ),
               ],
             ],
@@ -2792,7 +3178,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             children: [
               if (missingShots > 0)
                 _GateMiniButton(
-                  label: isSupplementing ? '正在补做…' : '补做缺失镜头',
+                  label: isSupplementing ? tr('novel_drama.supplementing_btn') : tr('novel_drama.supplement_btn'),
                   icon: Icons.auto_fix_high_rounded,
                   color: AppColors.danger,
                   busy: isSupplementing,
@@ -2801,7 +3187,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               if (finalUrl.isNotEmpty) ...[
                 if (missingShots > 0) const SizedBox(width: AppSpacing.sm),
                 _GateMiniButton(
-                  label: isReburning ? '重烧中…' : '微调台词',
+                  label: isReburning ? tr('novel_drama.reburning_btn') : tr('novel_drama.reburn_short_btn'),
                   icon: Icons.subtitles_outlined,
                   color: AppColors.primary,
                   busy: isReburning,
@@ -2809,7 +3195,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                 ),
                 const SizedBox(width: AppSpacing.sm),
                 _GateMiniButton(
-                  label: '播放本集',
+                  label: tr('novel_drama.play_ep_btn'),
                   icon: Icons.play_arrow_rounded,
                   color: AppColors.success,
                   onTap: () => webOpenInNewTab(Uri.parse(ApiClient.resolveUrl(finalUrl))),
@@ -2820,7 +3206,7 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                 TextButton.icon(
                   onPressed: () => setState(() => _expandedEpNo = isExpanded ? null : epNo),
                   icon: Icon(isExpanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down, size: 16),
-                  label: Text(isExpanded ? '收起分镜' : '看分镜(${shotsList.length})', style: AppTextStyles.caption),
+                  label: Text(isExpanded ? tr('novel_drama.collapse_shots_btn') : tr('novel_drama.view_shots_btn', args: {'n': '${shotsList.length}'}), style: AppTextStyles.caption),
                 ),
             ],
           ),
@@ -2895,27 +3281,27 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               children: [
                 Row(
                   children: [
-                    Text('镜 $idx · $shotType · ${duration}s',
+                    Text(tr('novel_drama.shot_meta_line', args: {'idx': '$idx', 'type': shotType, 'sec': duration}),
                         style: AppTextStyles.labelSmall.copyWith(fontWeight: FontWeight.w700)),
                     const Spacer(),
                     if (isVideoOk)
                       Icon(Icons.check_circle, size: 14, color: AppColors.success)
                     else if (isVideoFailed)
-                      Text('生成失败', style: AppTextStyles.caption.copyWith(color: AppColors.danger, fontWeight: FontWeight.w700))
+                      Text(tr('novel_drama.gen_failed'), style: AppTextStyles.caption.copyWith(color: AppColors.danger, fontWeight: FontWeight.w700))
                     else
-                      Text('待处理', style: AppTextStyles.caption.copyWith(color: AppColors.textTertiary)),
+                      Text(tr('novel_drama.shot_status_pending'), style: AppTextStyles.caption.copyWith(color: AppColors.textTertiary)),
                   ],
                 ),
                 if (dialogue.isNotEmpty) ...[
                   const SizedBox(height: AppSpacing.xxs),
-                  Text('台词: $dialogue',
+                  Text(tr('novel_drama.dialogue_line', args: {'text': dialogue}),
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: AppTextStyles.caption.copyWith(color: AppColors.primary, fontWeight: FontWeight.w600)),
                 ],
                 if (description.isNotEmpty) ...[
                   const SizedBox(height: AppSpacing.xxs),
-                  Text('画面: $description',
+                  Text(tr('novel_drama.description_line', args: {'text': description}),
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: AppTextStyles.caption.copyWith(color: AppColors.textTertiary)),
@@ -2931,6 +3317,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
   // ── 连集生产进度(门③通过后) ──────────────────────────────────────────
   Widget _buildProductionCard(Map<String, dynamic>? p) {
     final b = _batch;
+    // 铁律三:本次已产出成片的集(有 finalUrl 才算),供下方剧场展台渲染
+    final theaterArts = _episodeArtifacts();
     // 刷新页面后 _batch 还是空的(轮询已按 batchStatus 停了),此时退回门 payload
     // 上后端写回的终态,否则会把一个已完成的批次画成"连集生产中 EP1/1"。
     final status = (b?['status'] ?? p?['batchStatus'] ?? 'queued').toString();
@@ -2947,7 +3335,15 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     // 注:上游限流退避会持续刷新心跳条目的 at,所以这里量的不是"步骤多久没完成",
     // 而是"执行者多久没发声" —— 只有进程真没了/锁真僵尸才会触发 looksStuck。
     final staleMins = _minutesSince(lastLog?['at']);
-    const stepLabels = ['承接与大纲', '资产预检', '分镜脚本', '分镜关键帧', '分镜视频', '成片与状态回写'];
+    // 生产步骤名(展示文案走 tr();cursorStepLabel 是后端机器值,原样透出优先)
+    final stepLabels = [
+      tr('novel_drama.step_brief'),
+      tr('novel_drama.step_asset_check'),
+      tr('novel_drama.step_shot_script'),
+      tr('novel_drama.step_keyframes'),
+      tr('novel_drama.step_shot_video'),
+      tr('novel_drama.step_compose'),
+    ];
     // 非终态且长时间没动 = 执行者已经没了(进程重启 / 队列僵尸锁)
     final looksStuck = staleMins != null &&
         staleMins >= 10 &&
@@ -2961,7 +3357,13 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           tr('novel_drama.batch_failed', args: {'reason': (b?['error'] ?? p?['batchError'] ?? tr('novel_drama.see_drama_detail')).toString()})),
       'cancelled' => (AppColors.textTertiary, tr('novel_drama.batch_cancelled_title')),
       _ => (AppColors.primary,
-          '连集生产中:EP$curEp/$toEp · ${stepLabel.isNotEmpty ? stepLabel : (curStep >= 0 && curStep < 6 ? stepLabels[curStep] : '')}'),
+          tr('novel_drama.batch_producing_title', args: {
+            'cur': '$curEp',
+            'to': '$toEp',
+            'step': stepLabel.isNotEmpty
+                ? stepLabel
+                : (curStep >= 0 && curStep < 6 ? stepLabels[curStep] : ''),
+          })),
     };
     final double? value = status == 'done'
         ? 1.0
@@ -3005,6 +3407,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
           // 2026-09-16(批3 透明工作台):批次全时间线 —— 之前只取 log.last,
           // 用户看不到"每集哪步失败/为什么/烧了多少分";现在全量可展开倒序核对。
           Theme(
+            // 收起分组分割线 = 全透明(透明不是主题逃逸色,七套皮肤同值;
+            // 门禁 materialColors 指标也不统计它,故不加 cta-allow)
             data: ThemeData(dividerColor: Colors.transparent),
             child: ExpansionTile(
               tilePadding: EdgeInsets.zero,
@@ -3028,8 +3432,8 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
                         Expanded(
                           child: Text(
                             '${tr('novel_drama.timeline_entry', args: {'ep': '${l['ep']}', 'step': '${(_asInt(l['step']) ?? 0) + 1}', 'msg': '${l['msg'] ?? ''}'})}${credits > 0 ? tr('novel_drama.credits_unit', args: {'n': '$credits'}) : ''}${hhmm.isNotEmpty ? ' · $hhmm' : ''}',
-                            style: AppTextStyles.labelSmall.copyWith(
-                                fontSize: 10,
+                            // 10px 内联字阶 → AppTextStyles.caption(PR-2)
+                            style: AppTextStyles.caption.copyWith(
                                 color: ok ? AppColors.textSecondary : AppColors.danger),
                           ),
                         ),
@@ -3065,6 +3469,15 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
             busy: _deciding,
             onTap: _resumeBatch,
           ),
+        ],
+        // ════════════════════════════════════════════════════════════════
+        // 产物展台(DESIGN §四.4 铁律三,PR-4):连集成片 → WorkbenchTheater
+        // ────────────────────────────────────────────────────────────────
+        // 有成片才出现(空产物不占位);原有的「播放本集 / 看成片」入口保持不动,
+        // 剧场只是产物区的高级形态。
+        if (theaterArts.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.md),
+          WorkbenchTheater(artifacts: theaterArts),
         ],
         const SizedBox(height: AppSpacing.md),
         _buildEpisodesBreakdown(),
@@ -3136,6 +3549,83 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     );
   }
 
+  // ════════════════════════════════════════════════════════════════════
+  // 连集成片 → UsageArtifact 映射(铁律三 WorkbenchTheater 的产物口径)
+  // ────────────────────────────────────────────────────────────────────
+  //   id        = 'ep-<集号>'
+  //   taskId    = dramaUuid
+  //   type/mime = video / video/mp4(size 后端未下发,置 0,剧场只在 >0 时显示大小)
+  //   url       = ApiClient.resolveUrl(finalUrl) —— 后端给的是 /uploads/... 相对
+  //               路径,先统一解析成绝对地址,预览/下载(displayUrl 走 http 直通)
+  //               都稳;不解析的话非 '/' 开头的相对路径会被 _resolve 判空。
+  //   displayName = 集标题(缺省「第 N 集」);filename = URL 末段里带扩展名的才认
+  //   durationMs  = stepData.5.output.duration_sec × 1000
+  //   isFinal     = 集号最大的那一集(本页产物即连集成片,最后一集成片为主作品)
+  // 本页**无真实发布入口** → 不传 onPublish(发布按钮由组件自动隐藏,除假铁律);
+  // **无去水印后端** → 不传 onDownload(组件兜底走标准下载 downloadUsageArtifact)。
+  // ════════════════════════════════════════════════════════════════════
+  List<UsageArtifact> _episodeArtifacts() {
+    // 「有成片」的判定与 _buildEpisodeItemCard 逐字对齐(ep.finalUrl,缺省回落
+    // stepData.5.output.final_url),免得出现"卡片有播放本集、剧场里却没有"的错位
+    final eps = _episodes.where((e) => _episodeFinalUrl(e).isNotEmpty).toList();
+    if (eps.isEmpty) return const [];
+    var maxEpNo = 0;
+    for (final ep in eps) {
+      final n = (ep['epNo'] as num?)?.toInt() ?? 0;
+      if (n > maxEpNo) maxEpNo = n;
+    }
+    return [
+      for (final ep in eps)
+        _episodeToArtifact(
+          Map<String, dynamic>.from(ep),
+          isFinal: ((ep['epNo'] as num?)?.toInt() ?? 0) == maxEpNo,
+        ),
+    ];
+  }
+
+  /// 本集成片地址(与 _buildEpisodeItemCard 同口径:finalUrl 优先,
+  /// 缺省回落 stepData.5.output.final_url;都没有则空串 = 没成片)。
+  static String _episodeFinalUrl(Map<String, dynamic> ep) {
+    final sd = (ep['stepData'] as Map?)?.cast<String, dynamic>() ?? const {};
+    final out5 = (sd['5'] as Map?)?['output'] as Map?;
+    return (ep['finalUrl'] ?? out5?['final_url'] ?? '').toString();
+  }
+
+  UsageArtifact _episodeToArtifact(Map<String, dynamic> ep,
+      {required bool isFinal}) {
+    final epNo = (ep['epNo'] as num?)?.toInt() ?? 0;
+    final rawUrl = _episodeFinalUrl(ep);
+    final sd = (ep['stepData'] as Map?)?.cast<String, dynamic>() ?? const {};
+    final out5 = (sd['5'] as Map?)?['output'] as Map?;
+    final durationSec = (out5?['duration_sec'] as num?)?.toDouble() ?? 0.0;
+    final name = ep['title']?.toString();
+    return UsageArtifact(
+      id: 'ep-$epNo',
+      taskId: _dramaUuid ?? '',
+      type: ArtifactType.video,
+      mime: 'video/mp4',
+      size: 0,
+      status: 'ready',
+      url: ApiClient.resolveUrl(rawUrl),
+      displayName: (name == null || name.isEmpty)
+          ? tr('novel_drama.ep_fallback_title', args: {'n': '$epNo'})
+          : name,
+      filename: _artifactFileNameOf(rawUrl),
+      durationMs: (durationSec * 1000).round(),
+      isFinal: isFinal,
+    );
+  }
+
+  /// 成片文件名:URL 末段带扩展名的才认,否则留空让剧场按 displayName 展示。
+  static String? _artifactFileNameOf(String url) {
+    var name = url;
+    final q = name.indexOf('?');
+    if (q >= 0) name = name.substring(0, q);
+    final slash = name.lastIndexOf('/');
+    if (slash >= 0) name = name.substring(slash + 1);
+    return name.contains('.') ? name : null;
+  }
+
   /// 取消生产要二次确认:取消是终态,不会自动续跑,而已经烧掉的配额不会退回。
   Future<void> _confirmCancelBatch() async {
     final ok = await showDialog<bool>(
@@ -3167,25 +3657,39 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
     required String gateStatus,
     required List<Widget> body,
   }) {
+    final passed = gateStatus == 'passed';
+    final rejected = gateStatus == 'rejected';
+    // 通过/驳回时只给描边一点点语义色,底片与投影仍走全局规范
+    final borderColor = rejected
+        ? AppColors.danger.withValues(alpha: 0.35)
+        : passed
+            ? AppColors.success.withValues(alpha: 0.30)
+            : AppColors.borderLight;
+    final plateColor = rejected
+        ? AppColors.danger
+        : passed
+            ? AppColors.success
+            : AppColors.primary;
     return Container(
-      padding: const EdgeInsets.all(AppSpacing.lg),
+      padding: const EdgeInsets.all(AppSpacing.xl),
       decoration: BoxDecoration(
         color: AppColors.cardBg,
         borderRadius: BorderRadius.circular(AppColors.cardRadius),
-        border: Border.all(color: AppColors.border),
+        border: Border.all(color: borderColor),
+        boxShadow: AppShadow.s2(alpha: 0.05),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Icon(icon, size: 18, color: AppColors.primary),
-              const SizedBox(width: AppSpacing.sm),
+              _headerPlate(icon, color: plateColor, size: 32),
+              const SizedBox(width: AppSpacing.md),
               Expanded(child: Text(title, style: AppTextStyles.titleSmall)),
               _GateStatusChip(status: gateStatus),
             ],
           ),
-          const SizedBox(height: AppSpacing.md),
+          const SizedBox(height: AppSpacing.lg),
           ...body,
         ],
       ),
@@ -3193,16 +3697,34 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
   }
 
   Widget _stageHint(IconData icon, Color color, String text) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Icon(icon, size: 18, color: color),
-        const SizedBox(width: AppSpacing.sm),
-        Expanded(
-          child: Text(text,
-              style: AppTextStyles.bodySmall.copyWith(color: AppColors.textSecondary)),
-        ),
-      ],
+    // 轻容器化:与 WbInfoCard 同构的「淡底 + 描边 + 图标底片」,不再裸行
+    return Container(
+      padding: const EdgeInsets.all(AppSpacing.md),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(AppColors.slotRadius),
+        border: Border.all(color: color.withValues(alpha: 0.20), width: 0.5),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 28,
+            height: 28,
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(AppColors.slotRadius),
+            ),
+            child: Icon(icon, size: 15, color: color),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(
+            child: Text(text,
+                style: AppTextStyles.bodySmall
+                    .copyWith(color: AppColors.textSecondary, height: 1.55)),
+          ),
+        ],
+      ),
     );
   }
 
@@ -3216,16 +3738,57 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
   /// 用户能看见自己当初为什么否掉,否则"改回待确认"会丢掉唯一一条上下文。
   Widget _rejectedBlock(String gateKey, String text) {
     final note = _gatePayload(gateKey)?['rejectedNote']?.toString();
+    final hasNote = note != null && note.trim().isNotEmpty;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _stageHint(Icons.block_rounded, AppColors.danger, text),
-        if (note != null && note.trim().isNotEmpty) ...[
-          const SizedBox(height: AppSpacing.sm),
-          Text(tr('novel_drama.reject_note', args: {'note': note}),
-              style: AppTextStyles.labelSmall
-                  .copyWith(color: AppColors.textTertiary)),
-        ],
+        // 驳回说明 + 备注收在同一淡底容器里,不再「一行字 + 一行孤注」
+        Container(
+          padding: const EdgeInsets.all(AppSpacing.md),
+          decoration: BoxDecoration(
+            color: AppColors.danger.withValues(alpha: 0.06),
+            borderRadius: BorderRadius.circular(AppColors.slotRadius),
+            border: Border.all(
+                color: AppColors.danger.withValues(alpha: 0.20), width: 0.5),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: 28,
+                    height: 28,
+                    decoration: BoxDecoration(
+                      color: AppColors.danger.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(AppColors.slotRadius),
+                    ),
+                    child: Icon(Icons.block_rounded,
+                        size: 15, color: AppColors.danger),
+                  ),
+                  const SizedBox(width: AppSpacing.sm),
+                  Expanded(
+                    child: Text(text,
+                        style: AppTextStyles.bodySmall.copyWith(
+                            color: AppColors.textSecondary, height: 1.55)),
+                  ),
+                ],
+              ),
+              if (hasNote) ...[
+                const SizedBox(height: AppSpacing.sm),
+                Padding(
+                  padding: const EdgeInsets.only(left: 40),
+                  child: Text(
+                    tr('novel_drama.reject_note', args: {'note': note}),
+                    style: AppTextStyles.labelSmall
+                        .copyWith(color: AppColors.textTertiary, height: 1.5),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
         const SizedBox(height: AppSpacing.md),
         WbSubmitButton(
           label: tr('novel_drama.reopen_gate_btn'),
@@ -3438,8 +4001,9 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               const SizedBox(width: AppSpacing.sm),
               Expanded(
                 child: Text(title,
+                    // 中文标题伪粗 w800 → w700(PR-2 字重军规)
                     style: AppTextStyles.bodyMedium.copyWith(
-                        color: color, fontWeight: FontWeight.w800)),
+                        color: color, fontWeight: FontWeight.w700)),
               ),
             ],
           ),
@@ -3468,8 +4032,9 @@ class _NovelDramaWorkbenchPageState extends State<NovelDramaWorkbenchPage>
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  // 编号读数 → numberSmall 等宽(数字军规);英文编号读数按豁免保留加重
                   Text('EP${e['epNo']}',
-                      style: AppTextStyles.labelSmall
+                      style: AppTextStyles.numberSmall
                           .copyWith(color: AppColors.primary, fontWeight: FontWeight.w800)),
                   const SizedBox(width: AppSpacing.sm),
                   Expanded(
@@ -3521,10 +4086,11 @@ class _StatCell extends StatelessWidget {
             style: AppTextStyles.labelSmall
                 .copyWith(color: AppColors.textTertiary)),
         const SizedBox(height: AppSpacing.xs),
+        // 统计读数 → numberSmall 等宽(数字军规);值串含中文单位,加重按字重军规归 w700
         Text(value,
-            style: AppTextStyles.titleSmall
+            style: AppTextStyles.numberSmall
                 .copyWith(
-                    color: AppColors.primary, fontWeight: FontWeight.w900)),
+                    color: AppColors.primary, fontWeight: FontWeight.w700)),
       ],
     );
   }

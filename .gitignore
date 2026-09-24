@@ -181,3 +181,4 @@ backend/uploads/
 .loomy-attachments/
 .workbuddy*/
 .freebuff/
+node_modules
