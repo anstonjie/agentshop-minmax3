@@ -32,15 +32,19 @@ import { SkillDispatcher } from '../skills/skill-dispatcher.service';
 import { OssService } from '../oss/oss.service';
 import { planAssetShots } from '../drama/concept-art';
 import { buildShotVideoPrompt } from '../drama/video-prompt';
+import { cameraMotionGuide } from '../drama/camera-motion';
 import { buildTimeline, timelineToAss, timelineToSrt, assLayout, escapeAssText, wrapCueText } from '../drama/timeline';
 import { alignVideoWords, probeDurationSec, probeFps, probeHasAudio, probeResolution, resolveFfprobeBin } from './asr-align';
 import { auditCompose } from './video-audit';
 import { checkShotDescriptions, summarizeDescViolations } from '../drama/shot-description-guard';
 import { rhythmPromptGuide, checkEpisodeRhythm, checkEpisodeEndHook } from '../drama/rhythm-guard';
 import { planCompose } from '../drama/transition-plan';
-import { evaluateComposeGate } from '../drama/compose-gate';
+import { evaluateComposeGate, failedShotDetails } from '../drama/compose-gate';
 import { planShotRelay, groupIntoChains } from '../drama/relay-plan';
 import { RETRYABLE_IMAGE_STATUS } from '../../common/upstream-retry';
+import {
+  videoCreateBackoffMs, videoCreateStaggerMs, adaptI2vConcurrency,
+} from '../../common/upstream-retry';
 import { reportUpstreamBackoff, reportShotProgress } from '../../common/upstream-heartbeat';
 import {
   buildKeyframePlan, summarizePlans, indexLegacyConceptArt,
@@ -161,15 +165,69 @@ export class OpenMontageService {
   // 2026-09-16:i2v 并发信号量。上游视频队列是**全局**资源(video_queue_full 503),
   //   与 key 池无关 —— 11 镜 Promise.all 一把梭等于自己把队列打满,再贵的重试
   //   也救不回"创建请求根本进不去"。信号量把同时在飞的 i2v(创建+渲染)压到
-  //   DRAMA_I2V_CONCURRENCY(默认 4),创建请求自然错开,队列不再饱和。
+  //   有效并发(见 i2vConcurrency),创建请求自然错开,队列不再饱和。
+  // 2026-09-24:DRAMA_I2V_CONCURRENCY 改为**上限**(ceiling)语义 —— 滑动窗口里
+  //   503 过半自动对半降(不低于 2),连续健康缓慢回升。e2e 实测 12 路齐发撞死
+  //   11 号镜:固定并发 + 固定 65s 重试 = 集体重试同秒再撞。
   private i2vInFlight = 0;
   private readonly i2vWaiters: Array<() => void> = [];
-  private i2vConcurrency(): number {
+  private i2vRenderCap: number | null = null;
+  /** 最近创建结果滑动窗口(true=503,最多记 12 次;自适应并发的唯一输入) */
+  private readonly createOutcome503: boolean[] = [];
+  private i2vCeiling(): number {
     const n = Number(process.env.DRAMA_I2V_CONCURRENCY);
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
     // 2026-09-21:自适应 Key 池容量。避免拥有十几把 Key 却被写死为 4 并发,
     // 默认取 Key 池数量(同时设置安全上限 16),兼顾上游限流与最大并发生成吞吐。
     return Math.min(Math.max(4, this.agnesKeys.length), 16);
+  }
+  private i2vConcurrency(): number {
+    const ceil = this.i2vCeiling();
+    if (this.i2vRenderCap == null) this.i2vRenderCap = ceil;
+    return this.i2vRenderCap;
+  }
+  /** 记录一次创建结果并刷新有效并发(纯决策走 adaptI2vConcurrency,单测覆盖) */
+  private recordCreateOutcome(is503: boolean): void {
+    this.createOutcome503.push(!!is503);
+    if (this.createOutcome503.length > 12) this.createOutcome503.shift();
+    const ceil = this.i2vCeiling();
+    this.i2vRenderCap = adaptI2vConcurrency(
+      this.i2vRenderCap ?? ceil,
+      {
+        attempts: this.createOutcome503.length,
+        e503: this.createOutcome503.filter(Boolean).length,
+      },
+      ceil,
+    );
+  }
+  // 2026-09-24:创建槽位(与渲染槽位分离)。渲染槽位抱着最长 30min 轮询,
+  //   不能再用它限创建 —— 尾部镜头要等整段渲染完才允许创建,等于把并行压扁。
+  //   创建槽位只在 POST 瞬间持有(退避 sleep 时释放),上限默认 ceiling/3,
+  //   让创建请求全局错开而不至于同秒齐发。DRAMA_I2V_CREATE_CONCURRENCY 可覆盖。
+  private i2vCreateInFlight = 0;
+  private readonly i2vCreateWaiters: Array<() => void> = [];
+  private i2vCreateConcurrency(): number {
+    const n = Number(process.env.DRAMA_I2V_CREATE_CONCURRENCY);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+    return Math.max(2, Math.floor(this.i2vCeiling() / 3));
+  }
+  private acquireI2vCreateSlot(): Promise<() => void> {
+    return new Promise((resolve) => {
+      const release = () => {
+        this.i2vCreateInFlight = Math.max(0, this.i2vCreateInFlight - 1);
+        const next = this.i2vCreateWaiters.shift();
+        if (next) next();
+      };
+      const tryAcquire = (): boolean => {
+        if (this.i2vCreateInFlight < this.i2vCreateConcurrency()) {
+          this.i2vCreateInFlight++;
+          resolve(release);
+          return true;
+        }
+        return false;
+      };
+      if (!tryAcquire()) this.i2vCreateWaiters.push(tryAcquire);
+    });
   }
   /** 取一个 i2v 槽位;返回释放函数(必须在 finally 里调) */
   private acquireI2vSlot(): Promise<() => void> {
@@ -533,7 +591,7 @@ ${hasRoster ? `\n名单(小说账本抽取,禁止遗漏):\n${JSON.stringify(rost
     { "id": "veh_<名称拼音>", "name": "载具名", "description": "视觉描述", "used_by": [] }
   ],
   "wardrobe": [
-    { "id": "wd_<名称拼音>", "name": "服装名", "description": "视觉描述", "used_by": ["<角色id>"] }
+    { "id": "wd_<名称拼音>", "name": "服装名", "description": "视觉描述(只写衣服本身的版型/颜色/面料/细节,禁止写谁在穿、禁止描述人物)", "used_by": ["<角色id>"] }
   ]
 }`;
 
@@ -550,7 +608,7 @@ ${hasRoster ? `\n名单(小说账本抽取,禁止遗漏):\n${JSON.stringify(rost
   async genStep3ConceptArt(input: any, design: any, ctx: LlmCtx, sessionUuid: string): Promise<any> {
     if (!design) throw new BadRequestException('请先生成角色/场景/道具设计');
     const style = input.style || '电影质感, 高细节, 写实';
-    const result: any = { characters: [], locations: [], props: [] };
+    const result: any = { characters: [], locations: [], props: [], vehicles: [], wardrobe: [] };
 
     // 2026-09-05:seed 锁定(方案1)—— input.seed 为基线(未传则保持随机),
     //   每个「会话×资产×角度」稳定哈希偏移:重试同资产同角度必出同一张图。
@@ -600,6 +658,20 @@ ${hasRoster ? `\n名单(小说账本抽取,禁止遗漏):\n${JSON.stringify(rost
         id: prop.id, name: prop.name, url: img?.url ?? null, prompt: img?.prompt, error: img?.error,
       });
     }
+    // 2026-09-23 批5:vehicles/wardrobe 之前静默丢图 —— step2 生成了设计、
+    // indexLegacyConceptArt 也已收编,这里不出图它们就永远没有参考
+    for (const veh of design.vehicles || []) {
+      const [img] = await shoot('vehicle', veh);
+      result.vehicles.push({
+        id: veh.id, name: veh.name, url: img?.url ?? null, prompt: img?.prompt, error: img?.error,
+      });
+    }
+    for (const wd of design.wardrobe || []) {
+      const [img] = await shoot('wardrobe', wd);
+      result.wardrobe.push({
+        id: wd.id, name: wd.name, url: img?.url ?? null, prompt: img?.prompt, error: img?.error,
+      });
+    }
 
     return result;
   }
@@ -633,18 +705,44 @@ ${hasRoster ? `\n名单(小说账本抽取,禁止遗漏):\n${JSON.stringify(rost
 - **所有镜头 duration_sec 之和必须接近本集目标总时长**(见下方"目标总时长"),不要凭感觉缩水
 - 因此本集镜头数应落在 ${minShots}-${maxShots} 个之间
 - shot_type: 远景/全景/中景/近景/特写
-- camera_motion: 优先使用 推/拉/摇/跟/移, 严禁过多使用"静止"(静止容易在视频模型中沦为无动效死镜)
+${cameraMotionGuide()}
 - description 画面构图必须包含明确的人物肢体动作或环境动态(如走动、转头注视、手部操作、波纹起伏), 严禁毫无动静的静止画面, 彻底杜绝死镜
 - dialogue **每镜必填且只能有单个角色说话(最多1-2句核心台词, 12-25字)**: 严禁在同一个镜头内塞进双人甚至多人来回对话(视频模型只能对单口型, 多人对白必造成声音错乱、对口型失败及字幕霸屏); 两人交谈必须分镜头切换表达! 纯环境音写"(只有雨声/脚步/金属摩擦声)"; 旁白写"(旁白)…"
+- **因果链(叙事对齐,最高优先)**: 每一镜必须推进所属 scene 的剧情, 严禁东一棒槌西一棒槌的无关联画面堆砌;
+  上一镜 end_state 是下一镜 start_state 的起点; description/dialogue 必须服务下方"剧情锚点"里的 quotes 与 summary,
+  丢开锚点自由发挥 = 废镜
 - **大纲 scene 带 quotes(原文逐字锚点)时**: 该场镜头的 dialogue 与 description 必须基于 quotes 改编 ——
   dialogue 保留 quotes 里台词的含义(可口语化、不可改意), description 保留 quotes 里"谁/在哪/做了什么";
   禁止丢开 quotes 凭 summary 自由发挥
+- start_state: 一句话写清本镜开始时的可见状态(承接上一镜 end_state); 首镜写场景初始可见状态
 - handoff(多角色镜头): 一句话写清注意/持物/视线交接 —— 谁把什么交给谁、谁的视线从哪移到哪; 只写动作状态转换, 禁止写长相; 单人或无交接填空字符串
 - end_state: 一句话写清本镜结束时的可见状态(位置/姿态/持物), 下一镜从这里继续, 确保前后两镜时空与动作衔接自然, 严禁突兀闪现
-- **description 禁止描述人物长相/发型/服装**: 这些由角色定妆图决定, 文字再写一遍会和参考图打架导致换脸。只写构图、动作、环境、光线
+- **description 禁止描述人物长相/发型/服装/性别**: 这些由角色定妆图决定, 文字再写一遍会和参考图打架导致换脸/变性别。只写构图、动作、环境、光线
 ${rhythmPromptGuide()}`;
+    // 2026-09-23 叙事对齐:把场景剧情锚点(summary+quotes)与原文摘录**显式**塞进
+    //   user prompt —— 旧实现只 JSON.stringify(outline),LLM 容易丢掉 quotes,
+    //   分镜凭 ≤50 字 summary 重编 = 与小说脱节("东一棒槌西一棒槌"的分镜层根因)。
+    const scenesForPrompt = Array.isArray(outline.scenes) ? outline.scenes : [];
+    const sceneNarrative = scenesForPrompt.map((s: any) => {
+      const qs = Array.isArray(s?.quotes) ? s.quotes : [];
+      const qsBit = qs.length ? `\n  原文逐字: ${qs.join(' / ')}` : '';
+      const beatIds = Array.isArray(s?.beat_ids) && s.beat_ids.length
+        ? `\n  拍点: ${s.beat_ids.join(', ')}` : '';
+      return `场景#${s?.idx ?? '?'} ${s?.summary || ''}${qsBit}${beatIds}`;
+    }).filter(Boolean).join('\n');
+    const excerptBit = String(outline?.anchor?.chapterExcerpt || '').trim()
+      ? `\n\n=== 原文摘录(本集分镜必须讲明白的故事,按因果推进) ===\n${String(outline.anchor.chapterExcerpt).slice(0, 2500)}`
+      : '';
+    const beatsAnchorBit = String(outline?.anchor?.beatsAnchor || '').trim()
+      ? `\n\n=== 原文逐字锚点([必拍] 不可省) ===\n${String(outline.anchor.beatsAnchor).slice(0, 2000)}`
+      : '';
+
     const usr = `剧本大纲:
 ${JSON.stringify(outline, null, 2)}
+
+=== 本集剧情锚点(每一镜的 description/dialogue 必须服务这些拍点) ===
+${sceneNarrative || '(大纲无 scenes)'}
+${excerptBit}${beatsAnchorBit}
 
 本集目标总时长:${targetSec} 秒(镜头数 ${minShots}-${maxShots} 个,每镜 5-9 秒)
 
@@ -656,6 +754,12 @@ ${JSON.stringify((design?.locations || []).map((l: any) => ({ id: l.id, name: l.
 
 道具(供引用):
 ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name })), null, 2)}
+
+载具(供引用,本场出现时才挂到 shots.vehicles):
+${JSON.stringify((design?.vehicles || []).map((v: any) => ({ id: v.id, name: v.name })), null, 2)}
+
+服装(供引用,本场特殊造型时才挂到 shots.wardrobe;角色换装镜优先引用):
+${JSON.stringify((design?.wardrobe || []).map((w: any) => ({ id: w.id, name: w.name })), null, 2)}
 
 请输出:
 {
@@ -672,6 +776,9 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       "characters": ["char_1"],
       "location_id": "loc_1",
       "props": ["prop_1"],
+      "vehicles": ["veh_1"],
+      "wardrobe": ["wd_1"],
+      "start_state": "承接上一镜 end_state 的可见起点(首镜写场景初始状态)",
       "handoff": "(多角色镜头)A 把文件递给 B,B 的视线从桌面移到 A 脸上",
       "end_state": "B 合上文件夹,抬头看向门口"
     }
@@ -741,6 +848,76 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
     const hookWarnings = endHook.ok
       ? []
       : [`[集尾钩子门] ${endHook.reason};重生成仍未过,已标 hookShotMissing,建议人工改末镜或重跑本步`];
+
+    // ── 2026-09-23 叙事对齐:slug 归一 + 场景锚点 stamp ─────────────────────
+    // · LLM 常把 characters/location 写成中文名或大小写变体 → 归一到资产库 id,
+    //   否则 buildKeyframePlan 找不到 slug = 角色永远无参考图(unanchored)。
+    // · 每镜 stamp scene_summary/scene_quotes,step6 buildShotVideoPrompt 直接读,
+    //   不必再回查 outline(旧路径视频 prompt 零剧情上下文)。
+    const charIdSet: Set<string> = new Set((design?.characters || []).map((c: any) => String(c?.id)));
+    const charNameToId = new Map<string, string>(
+      (design?.characters || []).map((c: any) => [String(c?.name || '').trim(), String(c?.id)] as [string, string]),
+    );
+    const locIdSet: Set<string> = new Set((design?.locations || []).map((l: any) => String(l?.id)));
+    const locNameToId = new Map<string, string>(
+      (design?.locations || []).map((l: any) => [String(l?.name || '').trim(), String(l?.id)] as [string, string]),
+    );
+    const propIdSet: Set<string> = new Set((design?.props || []).map((p: any) => String(p?.id)));
+    const propNameToId = new Map<string, string>(
+      (design?.props || []).map((p: any) => [String(p?.name || '').trim(), String(p?.id)] as [string, string]),
+    );
+    const vehIdSet: Set<string> = new Set((design?.vehicles || []).map((v: any) => String(v?.id)));
+    const vehNameToId = new Map<string, string>(
+      (design?.vehicles || []).map((v: any) => [String(v?.name || '').trim(), String(v?.id)] as [string, string]),
+    );
+    const wdIdSet: Set<string> = new Set((design?.wardrobe || []).map((w: any) => String(w?.id)));
+    const wdNameToId = new Map<string, string>(
+      (design?.wardrobe || []).map((w: any) => [String(w?.name || '').trim(), String(w?.id)] as [string, string]),
+    );
+    const normId = (raw: any, idSet: Set<string>, nameToId: Map<string, string>): string | null => {
+      const s = String(raw ?? '').trim();
+      if (!s) return null;
+      if (idSet.has(s)) return s;
+      const byName = nameToId.get(s) || nameToId.get(s.toLowerCase());
+      if (byName) return byName;
+      return null; // 库内不认识的 slug 直接丢弃(进 unresolved,不污染分镜)
+    };
+    const sceneByIdx = new Map<number, any>(
+      scenesForPrompt.map((s: any) => [Number(s?.idx), s]),
+    );
+    shots = shots.map((sh: any) => {
+      const sc: any = sceneByIdx.get(Number(sh?.scene_idx)) || null;
+      return {
+        ...sh,
+        characters: (Array.isArray(sh?.characters) ? sh.characters : [])
+          .map((c: any) => normId(c, charIdSet, charNameToId))
+          .filter(Boolean),
+        location_id: normId(sh?.location_id, locIdSet, locNameToId) || undefined,
+        props: (Array.isArray(sh?.props) ? sh.props : [])
+          .map((p: any) => normId(p, propIdSet, propNameToId))
+          .filter(Boolean),
+        vehicles: (Array.isArray(sh?.vehicles) ? sh.vehicles : [])
+          .map((v: any) => normId(v, vehIdSet, vehNameToId))
+          .filter(Boolean),
+        wardrobe: (Array.isArray(sh?.wardrobe) ? sh.wardrobe : [])
+          .map((w: any) => normId(w, wdIdSet, wdNameToId))
+          .filter(Boolean),
+        scene_summary: String(sc?.summary || ''),
+        scene_quotes: Array.isArray(sc?.quotes) ? sc.quotes.map(String).filter(Boolean) : [],
+      };
+    });
+    // 因果链落库:handoff/end_state 只请求不校验会静默丢,这里只 warning 不拦
+    const missingHandoff = shots.filter((sh: any) => !String(sh?.handoff || '').trim()
+      && (Array.isArray(sh?.characters) && sh.characters.length > 1)).length;
+    const missingEnd = shots.filter((sh: any) => !String(sh?.end_state || '').trim()).length;
+    const missingRhythm = shots.filter((sh: any) => !String(sh?.rhythm || '').trim()).length;
+    const handoffChainWarnings: string[] = [];
+    if (missingHandoff) handoffChainWarnings.push(`多角色镜缺 handoff ${missingHandoff} 处`);
+    if (missingEnd) handoffChainWarnings.push(`缺 end_state ${missingEnd} 处`);
+    if (missingRhythm) handoffChainWarnings.push(`缺 rhythm ${missingRhythm} 处`);
+    if (handoffChainWarnings.length) {
+      this.logger.warn(`[step4] 因果链字段不全:${handoffChainWarnings.join(';')}`);
+    }
 
     let plannedSec = shots.reduce(
       (s: number, sh: any) => s + (Number(sh?.duration_sec) || 0), 0,
@@ -893,21 +1070,34 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
             shot_idx: plan.shotIdx, url, prompt: plan.prompt,
             ref_urls: plan.refUrls, ref_sources: plan.refSources,
             degraded: plan.degraded,
+            unanchored_characters: plan.unanchoredCharacters,
           };
         } catch (e: any) {
-          const fallbackUrl = (plan.refUrls || []).find((u: string) => typeof u === 'string' && /^https?:\/\//i.test(u));
+          // 2026-09-23 身份:兜底首帧只允许 character 参考图(与 drama.service ep-step3 同一条规则)
+          const charSrc = (plan.refSources || []).find(
+            (s: any) => s?.kind === 'character' && s?.sent
+              && typeof s?.url === 'string' && /^https?:\/\//i.test(s.url),
+          );
+          const fallbackUrl = charSrc?.url || null;
           if (fallbackUrl) {
-            this.logger.warn(`[step5] 镜 #${plan.shotIdx} 出图失败(${e?.message}), 自动使用定妆图兜底关键帧首帧`);
+            this.logger.warn(`[step5] 镜 #${plan.shotIdx} 出图失败(${e?.message}), 自动使用角色定妆图兜底关键帧首帧`);
             return {
               shot_idx: plan.shotIdx, url: fallbackUrl, prompt: plan.prompt,
               ref_urls: plan.refUrls, ref_sources: plan.refSources,
               degraded: plan.degraded, fallback_to_ref: true,
+              unanchored_characters: plan.unanchoredCharacters,
             };
+          }
+          if ((plan.refUrls || []).length) {
+            this.logger.warn(
+              `[step5] 镜 #${plan.shotIdx} 出图失败且无 character 参考图可兜底(拒绝场景图当身份锚):${e.message}`,
+            );
           }
           return {
             shot_idx: plan.shotIdx, url: null, prompt: plan.prompt,
             ref_urls: plan.refUrls, ref_sources: plan.refSources,
             degraded: plan.degraded, error: e.message,
+            unanchored_characters: plan.unanchoredCharacters,
           };
         }
       })();
@@ -929,6 +1119,8 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       missing_refs: sum.needReportrait,
       ref_backed: sum.withRef,
       degraded_count: sum.degraded,
+      unanchored_count: keyframes.filter((k: any) =>
+        Array.isArray(k.unanchored_characters) && k.unanchored_characters.length > 0).length,
     };
   }
 
@@ -1021,6 +1213,10 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
     let presettled = 0;
     let settledShots = 0;
     let failedShots = 0;
+    // 2026-09-24 首发错峰:genShot 闭包按 fan-out 顺序取号,第 N 个启动的先等
+    //   N×1.5s(封顶 12s)+抖动 —— 14 镜不再同秒齐发撞全局队列。复用/跳过路径
+    //   在取号前直接返回,不占错峰序号。
+    let launchSeq = 0;
     const bumpShot = (okShot: boolean) => {
       settledShots++;
       if (!okShot) failedShots++;
@@ -1047,22 +1243,58 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       const shot = shotMap[k.shot_idx];
       let imgUrl = imgUrlOverride || keyframeMap[k.shot_idx];
       // 2026-09-21: 镜头防丢容灾 —— 绝不因为单镜关键帧缺失就轻易 skipped 导致成片缺戏硬跳!
+      // 2026-09-23 身份收紧:兜底只认 character 参考图;跨镜兜底必须同场景 + 同 cast
+      //   (旧逻辑 ref_urls[0] / 前序任意镜 → 会把别的人/场景当首帧 → 变性别/换人)。
       if (!imgUrl) {
-        // ① 优先从该镜的关键帧参考图(角色定妆/场景图)取一张作为首帧
+        const curShot = shot;
+        const curLoc = String(curShot?.location_id || '');
+        const curCast = new Set(
+          (Array.isArray(curShot?.characters) ? curShot.characters : [])
+            .map((c: any) => String(c || '').trim()).filter(Boolean),
+        );
+        const castEq = (a?: string[], b?: string[]) => {
+          const sa = new Set((a || []).map(String).filter(Boolean));
+          const sb = new Set((b || []).map(String).filter(Boolean));
+          if (sa.size !== sb.size) return false;
+          for (const x of sa) if (!sb.has(x)) return false;
+          return true;
+        };
+        // ① 优先从该镜关键帧的 character 参考图取一张作为首帧
         const kfItem = (keyframes.keyframes || []).find((x: any) => x.shot_idx === k.shot_idx);
-        const refUrl = (kfItem?.ref_urls || []).find((u: string) => typeof u === 'string' && /^https?:\/\//i.test(u));
-        if (refUrl) {
-          imgUrl = refUrl;
-          this.logger.warn(`[step6] 镜 #${k.shot_idx} 关键帧缺失, 自动使用角色/场景定妆参考图兜底首帧`);
+        const charSrc = (kfItem?.ref_sources || []).find(
+          (s: any) => s?.kind === 'character' && typeof s?.url === 'string'
+            && /^https?:\/\//i.test(s.url),
+        );
+        if (charSrc?.url) {
+          imgUrl = charSrc.url;
+          this.logger.warn(`[step6] 镜 #${k.shot_idx} 关键帧缺失, 自动使用角色定妆参考图兜底首帧`);
         } else {
-          // ② 兜底找前序镜头的有效关键帧或参考图
-          const anyPrevKf = (keyframes.keyframes || [])
-            .filter((x: any) => x.shot_idx < k.shot_idx && (keyframeMap[x.shot_idx] || (x.ref_urls && x.ref_urls[0])))
+          // ② 前序镜兜底:必须同 location 且 characters 全等(含顺序无关集合相等)
+          const anyPrevKf = [...(keyframes.keyframes || [])]
+            .filter((x: any) => {
+              if (x.shot_idx >= k.shot_idx) return false;
+              const prevShot = shotMap[x.shot_idx];
+              const prevLoc = String(prevShot?.location_id || '');
+              if (curLoc && prevLoc && prevLoc !== curLoc) return false;
+              if (!castEq(
+                Array.isArray(prevShot?.characters) ? prevShot.characters : [],
+                Array.isArray(curShot?.characters) ? curShot.characters : [],
+              )) return false;
+              return !!(keyframeMap[x.shot_idx] || (Array.isArray(x.ref_urls) && x.ref_urls[0]));
+            })
             .pop();
-          const fallbackUrl = anyPrevKf ? (keyframeMap[anyPrevKf.shot_idx] || anyPrevKf.ref_urls[0]) : null;
+          const fallbackUrl = anyPrevKf
+            ? (keyframeMap[anyPrevKf.shot_idx]
+              || ((anyPrevKf.ref_urls || []).find((u: string) => typeof u === 'string' && /^https?:\/\//i.test(u)) as string)
+              || null)
+            : null;
           if (fallbackUrl) {
             imgUrl = fallbackUrl;
-            this.logger.warn(`[step6] 镜 #${k.shot_idx} 关键帧缺失, 自动使用前序镜 #${anyPrevKf.shot_idx} 画面兜底`);
+            this.logger.warn(`[step6] 镜 #${k.shot_idx} 关键帧缺失, 自动使用同场景同cast前序镜 #${anyPrevKf.shot_idx} 画面兜底`);
+          } else {
+            this.logger.warn(
+              `[step6] 镜 #${k.shot_idx} 无关键帧且无同场景同cast前序可兜底(loc=${curLoc || '?'}, cast=${[...curCast].join(',') || '空'}), 标记 skipped`,
+            );
           }
         }
       }
@@ -1085,45 +1317,82 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       // 2026-09-14(drama-skills 方法论):透传 characters/handoff/起止状态 ——
       //   >1 人同帧自动追加多人物守卫(身份区隔/手部持物/视线轮转),
       //   handoff 原样进 prompt,end_state 让下一镜有明确接缝。
-      // 2026-09-15:**补传 dialogue** —— 之前这里漏了台词,视频模型不知道要说什么,
-      //   只会自由发挥含糊人声,成片听不到剧本文本(用户反馈"没有对话"的根因之一)。
-      //   Agnes video 2.5-flash 本身输出人声音轨,台词写进 prompt 才会说对内容。
-      const videoPrompt = buildShotVideoPrompt(
-        {
-          description: shot?.description,
-          shot_type: shot?.shot_type,
-          camera_motion: shot?.camera_motion,
-          characters: Array.isArray(shot?.characters) ? shot.characters : undefined,
-          handoff: typeof shot?.handoff === 'string' ? shot.handoff : undefined,
-          start_state: typeof shot?.start_state === 'string' ? shot.start_state : undefined,
-          end_state: typeof shot?.end_state === 'string' ? shot.end_state : undefined,
-          dialogue: typeof shot?.dialogue === 'string' ? shot.dialogue : undefined,
-        },
-        {
-          fallback: k.prompt,
-          styleTail: typeof input?.style === 'string' ? input.style : undefined,
-          referenceMode: audioRefs.length > 0,
-          refImageCount: audioRefs.length > 0 ? 1 : 0,
-          refAudioCount: audioRefs.length,
-          knownNames,
-        },
-      );
+    // 2026-09-15:**补传 dialogue** —— 之前这里漏了台词,视频模型不知道要说什么,
+    //   只会自由发挥含糊人声,成片听不到剧本文本(用户反馈"没有对话"的根因之一)。
+    //   Agnes video 2.5-flash 本身输出人声音轨,台词写进 prompt 才会说对内容。
+    // 2026-09-23:storyBeat/prevEndState —— 5-10s 片段要知道在讲哪一场戏 + 承接上一镜终点,
+    //   否则纯运动指令堆叠 = 画面会动但剧情看不懂("东一棒槌西一棒槌"的视频层根因)。
+    const storyBeat = [
+      String(shot?.scene_summary || '').trim(),
+      ...(Array.isArray(shot?.scene_quotes) ? shot.scene_quotes.map(String).filter(Boolean) : []),
+    ].filter(Boolean).join(' | ');
+    const orderedShotIdxs = Object.keys(shotMap).map(Number).sort((a, b) => a - b);
+    const shotPos = orderedShotIdxs.indexOf(Number(k.shot_idx));
+    const prevShotObj = shotPos > 0 ? shotMap[orderedShotIdxs[shotPos - 1]] : null;
+    const prevEndState = String(prevShotObj?.end_state || '').trim();
+    const videoPrompt = buildShotVideoPrompt(
+      {
+        description: shot?.description,
+        shot_type: shot?.shot_type,
+        camera_motion: shot?.camera_motion,
+        rhythm: typeof shot?.rhythm === 'string' ? shot.rhythm : undefined,
+        characters: Array.isArray(shot?.characters) ? shot.characters : undefined,
+        handoff: typeof shot?.handoff === 'string' ? shot.handoff : undefined,
+        start_state: typeof shot?.start_state === 'string' ? shot.start_state : undefined,
+        end_state: typeof shot?.end_state === 'string' ? shot.end_state : undefined,
+        dialogue: typeof shot?.dialogue === 'string' ? shot.dialogue : undefined,
+      },
+      {
+        fallback: k.prompt,
+        styleTail: typeof input?.style === 'string' ? input.style : undefined,
+        referenceMode: audioRefs.length > 0,
+        refImageCount: audioRefs.length > 0 ? 1 : 0,
+        refAudioCount: audioRefs.length,
+        knownNames,
+        storyBeat: storyBeat || undefined,
+        prevEndState: shotPos > 0 ? (prevEndState || undefined) : undefined,
+        rhythm: typeof shot?.rhythm === 'string' ? shot.rhythm : undefined,
+      },
+    );
       // 逐镜 seed 偏移(方案1):同基线 + 镜号,补做/重试可复现。
       //   ⚠️ 上游 seed 范围 [0,999],偏移后 mod 1000。
+      // 2026-09-24 回炉换 seed:之前失败过的镜(503 出局/硬冻回炉)用原 seed 重烧,
+      //   同 seed + 同首帧大概率复现同一结果 → 补做白烧。prev 非 completed 且记过
+      //   seed → +17 链式偏移(仍确定可复现,只是换一条分布);首烧与成功镜不动。
       const shotSeed = seedBase != null
         ? (seedBase + (Number(k.shot_idx) || 0)) % 1000
         : undefined;
+      const prevEntry = prevMap[k.shot_idx];
+      const prevSeed = Number(prevEntry?.seed);
+      const effectiveSeed = (shotSeed != null && prevEntry && prevEntry.status !== 'completed'
+        && Number.isFinite(prevSeed))
+        ? (prevSeed + 17) % 1000
+        : shotSeed;
+      if (effectiveSeed !== shotSeed) {
+        this.logger.log(`[step6] 镜 #${k.shot_idx} 回炉换 seed ${shotSeed}→${effectiveSeed}(避复现)`);
+      }
 
       // 返回一个独立捕获异常的 Promise(单个失败不影响其他)
       // 2026-09-16:进 i2v 信号量槽位 —— 控制在飞视频数,防上游队列饱和 503
+      // 2026-09-24:渲染槽位只管"在飞",创建另有创建槽位 + 首发错峰(见上)
+      const launchOrder = launchSeq++;
       return (async () => {
+        if (launchOrder > 0) {
+          const staggerMs = videoCreateStaggerMs(launchOrder);
+          if (staggerMs > 0) await new Promise((r) => setTimeout(r, staggerMs));
+        }
         const releaseSlot = await this.acquireI2vSlot();
+        const t0 = Date.now();
         try {
           const videoUrl = await this.callVideoI2vWithKey(
             apiKey, videoPrompt, imgUrl, duration, videoAspect,
-            { seed: shotSeed, audios: audioRefs },
+            { seed: effectiveSeed, audios: audioRefs },
           );
           bumpShot(true);
+          this.logger.log(
+            `[step6] 镜 #${k.shot_idx} i2v 完成 ${Date.now() - t0}ms` +
+            `(${duration}s,relay=${imgUrlOverride ? 'tail' : 'kf'},seed=${effectiveSeed ?? '-'})`,
+          );
           return {
             shot_idx: k.shot_idx,
             video_url: videoUrl,
@@ -1131,11 +1400,19 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
             status: 'completed',
             prompt: videoPrompt,
             audio_referenced: audioRefs.length > 0,
-            seed: shotSeed ?? null,
+            seed: effectiveSeed ?? null,
           };
         } catch (e: any) {
           bumpShot(false);
-          return { shot_idx: k.shot_idx, video_url: null, status: 'failed', error: e.message };
+          // 结构化失败信号:on-call 要能从一条日志回答「哪一镜、多久、什么错」
+          this.logger.error(
+            `[step6] 镜 #${k.shot_idx} i2v 失败 ${Date.now() - t0}ms: ${e.message || e}`,
+          );
+          // 2026-09-24:失败也记 seed,下次回炉据此链式偏移(不记就永远同 seed 复现)
+          return {
+            shot_idx: k.shot_idx, video_url: null, status: 'failed',
+            error: e.message, seed: effectiveSeed ?? null,
+          };
         } finally {
           releaseSlot();
         }
@@ -1255,6 +1532,9 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
     for (const s of shotsScript?.shots || []) shotMap[s.idx] = s;
 
     let idx = 0;
+    // 2026-09-24 缺镜点名:下载失败同样记名(之前只有 warn,产出里无痕)。
+    const failedDetails = failedShotDetails(shotsVideo.shots);
+    const failedByIdx = new Map(failedDetails.map((d) => [d.shot_idx, d]));
     for (const sv of shotsVideo.shots) {
       if (!sv.video_url) continue;
       const segPath = path.join(composeDir, `seg_${String(idx).padStart(3, '0')}.mp4`);
@@ -1268,6 +1548,13 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
         idx++;
       } catch (e: any) {
         this.logger.warn(`下载分镜 ${sv.shot_idx} 失败: ${e.message}`);
+        if (!failedByIdx.has(Number(sv.shot_idx))) {
+          failedByIdx.set(Number(sv.shot_idx), {
+            shot_idx: Number(sv.shot_idx),
+            status: 'download_failed',
+            reason: String(e?.message || 'download failed').replace(/\s+/g, ' ').slice(0, 120),
+          });
+        }
       }
     }
 
@@ -1578,6 +1865,30 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
     }
 
     const stats = fs.statSync(finalPath);
+    // 2026-09-24:质检结论映射回镜号。audit 里的 static/frozenShots 是片段序号
+    //   (0 基,已剔回顾段);used[] 与 segPaths 同序且只含正片 → used[i] 即该片段的镜。
+    //   输出 audit_shots 供编排器自动回炉硬冻镜(static 仅提示,不自动烧额度)。
+    const segToShotIdx = (segIdx: number): number | null => {
+      const sh = used[segIdx]?.video?.shot_idx;
+      const n = Number(sh);
+      return Number.isFinite(n) ? n : null;
+    };
+    const auditShotIdxs = { static: [] as number[], frozen: [] as number[] };
+    if (audit && !audit.skipped) {
+      for (const s of audit.staticShots || []) {
+        const sh = segToShotIdx(Number(s));
+        if (sh != null && !auditShotIdxs.static.includes(sh)) auditShotIdxs.static.push(sh);
+      }
+      for (const s of audit.frozenShots || []) {
+        const sh = segToShotIdx(Number(s));
+        if (sh != null && !auditShotIdxs.frozen.includes(sh)) auditShotIdxs.frozen.push(sh);
+      }
+      auditShotIdxs.static.sort((a, b) => a - b);
+      auditShotIdxs.frozen.sort((a, b) => a - b);
+      if (auditShotIdxs.frozen.length) {
+        this.logger.warn(`[step7] 硬冻镜 ${auditShotIdxs.frozen.map((i) => `#${i}`).join('、')} → 可自动回炉`);
+      }
+    }
     return {
       final_url: `${urlBase}/final.mp4`,
       final_path: finalPath,
@@ -1586,6 +1897,8 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       planned_shots: plannedShots,
       composed_shots: bodySegCount,
       missing_shots: missingShots,
+      // 2026-09-24:缺哪几镜、为什么(点名,供时间线/前端一键补做打靶;下载失败也记名)
+      failed_shots: [...failedByIdx.values()].sort((a, b) => a.shot_idx - b.shot_idx),
       // 2026-09-16(批3):集首视觉回顾状态(null=未启用/非第2集起;{enabled:false,reason}=降级)
       recap: recapInfo,
       // 2026-09-16(批3 透明工作台):字幕全文落库 —— 之前只落磁盘 timeline.json,
@@ -1623,6 +1936,8 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
       },
       // P1-c 成片质检结论(可能为 null=关闭,或 {skipped,reason})。前端据此显示"死镜/硬跳接缝"并可打靶回炉。
       audit,
+      // 2026-09-24:质检点名到镜号(片段序号→shot_idx,见上),编排器据此自动回炉硬冻镜
+      audit_shots: auditShotIdxs,
     };
   }
 
@@ -2021,6 +2336,9 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
     const createTimeoutMs = useReference ? 240_000 : 180_000;
     for (let attempt = 1; attempt <= maxCreateAttempts; attempt++) {
       await this.acquireVideoCreateSlot(apiKey);
+      // 创建槽位只抱住 POST 瞬间:退避 sleep 时释放,让出给别的镜头,
+      // 否则退避中的镜头会把创建通道堵死(队头阻塞)。
+      const releaseCreate = await this.acquireI2vCreateSlot();
       lastErr = null;
       try {
         createResp = await axios.post(createUrl, body, {
@@ -2032,6 +2350,8 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
           validateStatus: () => true,
         });
       } catch (e: any) {
+        releaseCreate();
+        this.recordCreateOutcome(false);
         // 循环开头的 acquireVideoCreateSlot 会自然等到下一个限流窗口,不用额外 sleep
         createResp = null;
         lastErr = e;
@@ -2043,22 +2363,27 @@ ${JSON.stringify((design?.props || []).map((p: any) => ({ id: p.id, name: p.name
         reportUpstreamBackoff(`视频创建超时/网络失败,重试 ${attempt}/${maxCreateAttempts - 1}`);
         continue;
       }
+      releaseCreate();
       // 2026-09-16:503 video_queue_full 并入重试 —— 之前只有 429 / 网络失败会重试,
       //   503 直接 break 抛错成"这一镜 failed"。实测 drama77 七集 90% 镜头死在这里:
       //   11 镜并发打满上游队列,queue_full 不重试 = 整集只剩 1 个存活段
       //   (成片 10s 的直接根因,见 docs/短视频一键生成-七问题再排查与修复方案)。
+      // 2026-09-24:退避改指数 + 抖动(固定 65s 会让 N 路并发同秒集体重试、同秒再撞,
+      //   e2e 11 号镜就是这么 4 次烧完的)。每次创建结果进滑动窗口,503 高压自动降并发。
       const queueFull = createResp.status === 503
         || createResp.data?.code === 'video_queue_full';
+      this.recordCreateOutcome(queueFull);
       if (createResp.status !== 429 && !queueFull) break;
       if (attempt === maxCreateAttempts) break;
+      const waitMs = videoCreateBackoffMs(attempt);
       this.logger.warn(
         `[step6] Agnes video create ${queueFull ? '503 队列满' : '429'}(key …${apiKey.slice(-4)}),` +
-        `65s 后重试 ${attempt}/${maxCreateAttempts - 1}`,
+        `${Math.round(waitMs / 1000)}s 后重试 ${attempt}/${maxCreateAttempts - 1}(并发${this.i2vConcurrency()})`,
       );
       reportUpstreamBackoff(
-        `视频通道 ${queueFull ? '队列满(503)' : '429 限流'},65s 后重试(${attempt}/${maxCreateAttempts - 1})`,
+        `视频通道 ${queueFull ? '队列满(503)' : '429 限流'},${Math.round(waitMs / 1000)}s 后重试(${attempt}/${maxCreateAttempts - 1})`,
       );
-      await new Promise((r) => setTimeout(r, 65_000));
+      await new Promise((r) => setTimeout(r, waitMs));
     }
     if (!createResp) {
       throw new Error(

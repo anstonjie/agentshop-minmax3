@@ -23,6 +23,31 @@ export interface UnitPrices {
 /** 默认单价(积分 / 单元)。video 按 image 的 5 倍估,待平台方核对。 */
 export const DEFAULT_UNIT_PRICES: UnitPrices = { image: 8, video: 40, llm: 2 };
 
+/**
+ * 连集 policy 白名单归一(纯函数,可单测)。
+ * 必须透传 epTargetSec:orchestrator 靠它决定 step0/2 集长。
+ * 之前只存 5 个字段,novel-pipeline 传入的 epTargetSec 被静默丢掉,
+ * 编排器 fallback 成 0 → 再查账本/兜底 120,自定义目标(如 60)会丢。
+ */
+export function normalizeBatchPolicy(input: Record<string, any>): Record<string, any> {
+  const policy = input || {};
+  const budget = Number(policy.budgetCredits);
+  // Number(null)===0 且 isFinite(0)===true —— 不能只靠 isFinite,否则 null 被放行
+  if (policy.budgetCredits == null || policy.budgetCredits === '' || !Number.isFinite(budget) || budget <= 0) {
+    throw new Error('必须显式给出积分预算 budgetCredits —— 连集不允许无上限烧分');
+  }
+  return {
+    autoAssetConfirm: policy.autoAssetConfirm !== false,
+    autoVisual: policy.autoVisual !== false,
+    stopOnFailure: policy.stopOnFailure === true,
+    candidatesPerShot: Number(policy.candidatesPerShot) || 2,
+    budgetCredits: budget,
+    ...(Number(policy.epTargetSec) > 0
+      ? { epTargetSec: Math.round(Number(policy.epTargetSec)) }
+      : {}),
+  };
+}
+
 /** 从 batch.policy 里取单价,缺项回落默认 */
 export function resolvePrices(policy: any): UnitPrices {
   const p = policy?.unitPrices || {};

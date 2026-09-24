@@ -294,3 +294,80 @@ describe('buildShotVideoPrompt 多人物与状态链(2026-09-14)', () => {
     expect(idx('spoken line')).toBeLessThan(idx('medium shot'));
   });
 });
+
+// ============================================================================
+// 2026-09-23 叙事对齐 + 身份尾巴
+// ============================================================================
+describe('buildShotVideoPrompt 剧情锚点与单人身份(2026-09-23)', () => {
+  it('storyBeat 进 prompt(5-10s 片段知道自己在讲哪一场戏)', () => {
+    const p = buildShotVideoPrompt(
+      { description: '她推开铁门' },
+      { storyBeat: '林越潜入控制室 | 原文:门轴发出轻响' },
+    );
+    expect(p).toContain('story beat for this shot');
+    expect(p).toContain('林越潜入控制室');
+    expect(p).toContain('门轴发出轻响');
+  });
+
+  it('prevEndState 进 prompt(承接上一镜可见终点,拼因果链)', () => {
+    const p = buildShotVideoPrompt(
+      { description: '她回头' },
+      { prevEndState: 'B 合上文件夹抬头' },
+    );
+    expect(p).toContain('continue from previous shot ending');
+    expect(p).toContain('B 合上文件夹抬头');
+  });
+
+  it('恰好 1 人 → 单人身份尾巴(禁镜内变性别/换人);0 人不追加', () => {
+    const solo = buildShotVideoPrompt({ description: '一人独行', characters: ['char_1'] });
+    expect(solo).toContain('do not change gender');
+    expect(solo).not.toContain('identity blending');
+
+    const empty = buildShotVideoPrompt({ description: '空镜街景' });
+    expect(empty).not.toContain('do not change gender');
+  });
+
+  it('单人身份尾巴不违反外貌铁律(不含 same face/hairstyle/wardrobe)', () => {
+    const p = buildShotVideoPrompt({ description: '一人独行', characters: ['char_1'] });
+    expect(p).not.toMatch(/hairstyle|wardrobe|facial features|same face/i);
+  });
+});
+
+// ============================================================================
+// 2026-09-24 运镜扩词 + rhythm 兜底(飞书《各种运镜提示词》)
+// ============================================================================
+describe('buildShotVideoPrompt 扩词与 rhythm 兜底(2026-09-24)', () => {
+  it('文档扩词可进视频 prompt(过肩/穿拍/俯拍)', () => {
+    expect(buildShotVideoPrompt({ description: '对话', camera_motion: '过肩' }))
+      .toContain('over-the-shoulder');
+    expect(buildShotVideoPrompt({ description: '进门', camera_motion: '穿拍' }))
+      .toMatch(/fly-through|through a window|through/);
+    expect(buildShotVideoPrompt({ description: '俯瞰', camera_motion: '俯拍' }))
+      .toMatch(/top-down|from above/);
+  });
+
+  it('camera_motion 缺失时按 rhythm 兜底(hook→快推)', () => {
+    const p = buildShotVideoPrompt({ description: '开场', rhythm: 'hook' });
+    expect(p).toMatch(/FAST DOLLY IN|rapid push/);
+  });
+
+  it('camera_motion 为静止时若带 rhythm 仍兜底(防死镜);无 rhythm 保持静止', () => {
+    const withRhythm = buildShotVideoPrompt({ description: '重音', camera_motion: '静止', rhythm: 'beat' });
+    expect(withRhythm).toMatch(/FAST DOLLY IN|rapid push/);
+    expect(withRhythm).not.toContain('static locked-off');
+    const bare = buildShotVideoPrompt({ description: '定格', camera_motion: '静止' });
+    expect(bare).toContain('static locked-off');
+  });
+
+  it('已写有效运镜时不被 rhythm 覆盖', () => {
+    const p = buildShotVideoPrompt({ description: '侧移', camera_motion: '移', rhythm: 'hook' });
+    expect(p).toContain('lateral tracking');
+    expect(p).not.toMatch(/FAST DOLLY IN/);
+  });
+
+  it('未知 rhythm + 无运镜 → 不进 undefined,仍有底线词', () => {
+    const p = buildShotVideoPrompt({ description: '画面', rhythm: '外星节奏' });
+    expect(p).not.toContain('undefined');
+    expect(p).toContain('smooth natural motion');
+  });
+});

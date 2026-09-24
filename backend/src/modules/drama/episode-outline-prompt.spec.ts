@@ -90,6 +90,49 @@ describe('buildEpisodeOutlinePrompt 承接信息注入', () => {
     expect(user).toContain('"established_facts_new"');
     expect(user).toContain('"character_states"');
   });
+
+  // 2026-09-24:场景契约补 vehicles/wardrobe —— 大纲层不给字段,
+  // collectNeeds / 分镜永远扫不到载具与服装
+  it('scenes 输出契约带 vehicles/wardrobe 数组', () => {
+    const { user } = buildEpisodeOutlinePrompt(base as any);
+    expect(user).toContain('"vehicles"');
+    expect(user).toContain('"wardrobe"');
+  });
+
+  // 2026-09-23 批5:契约只写 character|location|prop,LLM 照契约给不出
+  // vehicle/wardrobe → 载具/服装需求在大纲层就断了
+  it('needs_assets kind 契约覆盖全部五类(含 vehicle/wardrobe)', () => {
+    const { system, user } = buildEpisodeOutlinePrompt(base as any);
+    expect(user).toContain('character|location|prop|vehicle|wardrobe');
+    expect(system).toContain('服装只写衣服本身');
+  });
+
+  // ── 2026-09-23 叙事对齐:禁凑戏 + beat_ids 1:1 映射 ──
+  it('system 禁止为凑时长发明新主线,只允许深化已有拍点', () => {
+    const { system } = buildEpisodeOutlinePrompt(base as any);
+    expect(system).toContain('禁止发明与原文、使命无关的新主线来凑秒数');
+    expect(system).toContain('深化已有场景/拍点');
+    expect(system).not.toContain('内容不够就把场景写足、把冲突写透,而不是交一个比目标短一半的本子');
+  });
+
+  it('有原文锚点时 system 要求 beat_ids 且 [必拍] 全覆盖', () => {
+    const { system, user } = buildEpisodeOutlinePrompt({
+      ...base,
+      beatsAnchor: '- {ch1-b1} [必拍] 林越发现登记簿:「第七任守塔人是谁」',
+      chapterExcerpt: '原文摘录……',
+    } as any);
+    expect(system).toContain('beat 1:1 映射');
+    expect(system).toContain('beat_ids');
+    expect(system).toContain('把已有拍点写深');
+    expect(system).toContain('禁止为凑时长发明锚点/摘录里没有的新主线情节');
+    expect(user).toContain('"beat_ids"');
+    expect(user).toContain('本集原文锚点');
+  });
+
+  it('无锚点时不渲染 beat_ids 硬规则(避免误导纯原创集)', () => {
+    const { system } = buildEpisodeOutlinePrompt(base as any);
+    expect(system).not.toContain('beat 1:1 映射');
+  });
 });
 
 describe('normalizeEpisodeOutline', () => {
@@ -102,9 +145,20 @@ describe('normalizeEpisodeOutline', () => {
     expect(outline.scenes[0].estimated_sec).toBe(30);
     expect(outline.scenes[0].characters).toEqual([]);
     expect(outline.scenes[0].props).toEqual([]);
+    expect(outline.scenes[0].vehicles).toEqual([]);
+    expect(outline.scenes[0].wardrobe).toEqual([]);
     expect(outline.established_facts_new).toEqual([]);
     expect(outline.character_states).toEqual({});
     expect(warnings.some((w) => w.includes('结尾钩子'))).toBe(true);
+  });
+
+  // 2026-09-24:场景引用归一 —— 与 characters/props 同路径,供 collectNeeds 扫
+  it('normalize:场景 vehicles/wardrobe 归一为字符串数组、去重', () => {
+    const { outline } = normalizeEpisodeOutline({
+      scenes: [{ idx: 1, vehicles: ['veh_boat', 'veh_boat', ''], wardrobe: ['wd_coat', 5] }],
+    });
+    expect(outline.scenes[0].vehicles).toEqual(['veh_boat']);
+    expect(outline.scenes[0].wardrobe).toEqual(['wd_coat', '5']);
   });
 
   it('完全没有场景时告警,不静默返回可用假象', () => {
@@ -164,6 +218,23 @@ describe('normalizeEpisodeOutline', () => {
     expect(outline.needs_assets[0].descPersona).toBe('刑警');
   });
 
+  // 2026-09-23 批5:非法 kind 流到 createAsset 抛 400 → resolvePrecheck 中途断,
+  // 已应用的裁决无事务回滚。normalize 层先拦。
+  it('白名单外的 kind 被丢弃并告警,vehicle/wardrobe 合法保留', () => {
+    const { outline, warnings } = normalizeEpisodeOutline({
+      title: 'T', scenes: [{ idx: 1 }],
+      needs_assets: [
+        { kind: 'vehicle', name: '渔船', slug: 'veh_boat', descVisual: '木质拖网船' },
+        { kind: 'wardrobe', name: '风衣', slug: 'wd_coat', descVisual: '卡其风衣' },
+        { kind: 'weapon', name: '长刀', slug: 'wx_knife', descVisual: '刃有缺口' },
+        { kind: 'CHARACTER', name: '配角', slug: 'char_x', descVisual: '络腮胡' },
+      ],
+    });
+    expect(outline.needs_assets.map((n: any) => n.kind))
+      .toEqual(['vehicle', 'wardrobe', 'character']);
+    expect(warnings.some((w) => w.includes('weapon'))).toBe(true);
+  });
+
   it('LLM 返回完全不可解析时不崩', () => {
     expect(() => normalizeEpisodeOutline(null)).not.toThrow();
     expect(() => normalizeEpisodeOutline(undefined)).not.toThrow();
@@ -186,6 +257,20 @@ describe('quotes 逐字锚点(2026-09-16 批2)', () => {
     expect(outline.scenes[0].quotes).toEqual([]);
   });
 
+  // 2026-09-23:beat_ids 归一(与 quotes 同路径)
+  it('normalize:beat_ids 归一为字符串数组、去重、上限 8', () => {
+    const { outline } = normalizeEpisodeOutline({
+      scenes: [{ idx: 1, beat_ids: ['ch1-b1', 'ch1-b1', 'ch1-b2', 7, ''] }],
+    });
+    expect(outline.scenes[0].beat_ids).toEqual(['ch1-b1', 'ch1-b2', '7']);
+    expect(outline.scenes[0].beat_ids.length).toBeLessThanOrEqual(8);
+  });
+
+  it('缺 beat_ids 字段补空数组(无锚点集合法)', () => {
+    const { outline } = normalizeEpisodeOutline({ scenes: [{}] });
+    expect(outline.scenes[0].beat_ids).toEqual([]);
+  });
+
   it('outlineQuoteStats 汇总场数/引用场数/扁平 quotes', () => {
     const s = outlineQuoteStats({ scenes: [{ quotes: ['x', 'y'] }, { quotes: [] }, { quotes: ['y'] }] });
     expect(s).toEqual({ scenes: 3, withQuotes: 2, quotes: ['x', 'y'] });
@@ -193,5 +278,22 @@ describe('quotes 逐字锚点(2026-09-16 批2)', () => {
 
   it('stats 空大纲安全', () => {
     expect(outlineQuoteStats(null)).toEqual({ scenes: 0, withQuotes: 0, quotes: [] });
+  });
+});
+
+// 2026-09-24:场景资产引用扁平化 —— collectNeeds / 预检共用同一扫描口径
+import { sceneAssetSlugs } from './episode-outline-prompt';
+
+describe('sceneAssetSlugs', () => {
+  it('汇出 characters/props/vehicles/wardrobe/location 全部引用', () => {
+    expect(sceneAssetSlugs({
+      characters: ['c1'], props: ['p1'], vehicles: ['v1'], wardrobe: ['w1'],
+      location_id: 'loc1', location: '码头',
+    })).toEqual(['c1', 'p1', 'v1', 'w1', 'loc1', '码头']);
+  });
+
+  it('缺字段不炸,空场景返回空数组', () => {
+    expect(sceneAssetSlugs({})).toEqual([]);
+    expect(sceneAssetSlugs(null)).toEqual([]);
   });
 });

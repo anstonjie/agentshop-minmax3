@@ -107,8 +107,12 @@ describe('checkEpisodeEndHook —— 集尾钩子镜头硬门(2026-09-16 批2)',
     expect(v2.reason || '').toContain('换气');
   });
 
-  it('整集没标 rhythm = 不拦(可选字段,避免误杀老数据)', () => {
-    expect(checkEpisodeEndHook([{ idx: 1 }, { idx: 2 }]).ok).toBe(true);
+  it('整集没标 rhythm = 拦(2026-09-23 空过作废,否则集尾钩子门形同虚设)', () => {
+    const v = checkEpisodeEndHook([{ idx: 1 }, { idx: 2 }]);
+    expect(v.ok).toBe(false);
+    expect(v.reason || '').toContain('未标 rhythm');
+    expect(v.lastIdx).toBe(2);
+    // 空列表/无输入仍是"无事可查",不拦
     expect(checkEpisodeEndHook([]).ok).toBe(true);
     expect(checkEpisodeEndHook(null as any).ok).toBe(true);
   });

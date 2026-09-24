@@ -3,7 +3,7 @@
 // ============================================================================
 import {
   resolvePrices, DEFAULT_UNIT_PRICES, unitsFromStepOutput, addUnits,
-  unitsToCredits, checkBudget, estimateBatchCredits,
+  unitsToCredits, checkBudget, estimateBatchCredits, normalizeBatchPolicy,
 } from './drama-pricing';
 
 describe('resolvePrices', () => {
@@ -104,5 +104,31 @@ describe('estimateBatchCredits 开跑前预估', () => {
     const withAssets = estimateBatchCredits(1, DEFAULT_UNIT_PRICES, { shotsPerEpisode: 10, newAssets: 2 });
     const plain = estimateBatchCredits(1, DEFAULT_UNIT_PRICES, { shotsPerEpisode: 10 });
     expect(withAssets.images - plain.images).toBe(8); // 2 项 × 4 视图
+  });
+});
+
+describe('normalizeBatchPolicy 白名单归一', () => {
+  it('必须透传 epTargetSec(orchestrator 靠它决定 step0/2 集长)', () => {
+    const p = normalizeBatchPolicy({ budgetCredits: 500, epTargetSec: 120 });
+    expect(p.epTargetSec).toBe(120);
+    expect(p.budgetCredits).toBe(500);
+  });
+  it('非法/缺失 epTargetSec 不写字段(交编排器走账本/兜底)', () => {
+    expect(normalizeBatchPolicy({ budgetCredits: 100 }).epTargetSec).toBeUndefined();
+    expect(normalizeBatchPolicy({ budgetCredits: 100, epTargetSec: 0 }).epTargetSec).toBeUndefined();
+    expect(normalizeBatchPolicy({ budgetCredits: 100, epTargetSec: 'x' }).epTargetSec).toBeUndefined();
+  });
+  it('缺 budgetCredits 抛错(连集不允许无上限烧分)', () => {
+    expect(() => normalizeBatchPolicy({})).toThrow(/budgetCredits/);
+    expect(() => normalizeBatchPolicy({ budgetCredits: null })).toThrow(/budgetCredits/);
+  });
+  it('布尔默认:auto* 缺省 true,stopOnFailure 缺省 false', () => {
+    const p = normalizeBatchPolicy({ budgetCredits: 1 });
+    expect(p.autoAssetConfirm).toBe(true);
+    expect(p.autoVisual).toBe(true);
+    expect(p.stopOnFailure).toBe(false);
+    const q = normalizeBatchPolicy({ budgetCredits: 1, stopOnFailure: true, autoVisual: false });
+    expect(q.stopOnFailure).toBe(true);
+    expect(q.autoVisual).toBe(false);
   });
 });

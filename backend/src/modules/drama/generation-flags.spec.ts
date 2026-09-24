@@ -67,6 +67,15 @@ describe('P1-a relay-plan —— 默认关=空计划(保持并行现状)', () =>
     expect(r.pairs[0]).toMatchObject({ from: 1, to: 2, why: 'same-location' });
   });
 
+  it('enabled + 同场景但换人(cast 不兼容)→ 硬切(2026-09-23 身份:尾帧不得带错人)', () => {
+    const r = planShotRelay(
+      [S(1, { location_id: 'a', characters: ['c1'] }), S(2, { location_id: 'a', characters: ['c9'] })],
+      { enabled: true },
+    );
+    expect(r.pairs).toEqual([]);
+    expect(r.hardCuts).toEqual([{ from: 1, to: 2 }]);
+  });
+
   it('enabled + 异场景但有 handoff → handoff 接力', () => {
     const r = planShotRelay(
       [S(1, { location_id: 'a' }), S(2, { location_id: 'b', handoff: 'A 把信递给 B' })],
@@ -75,9 +84,9 @@ describe('P1-a relay-plan —— 默认关=空计划(保持并行现状)', () =>
     expect(r.pairs[0].why).toBe('handoff');
   });
 
-  it('enabled + 异场景无交接但共享角色 → shared-cast', () => {
+  it('enabled + 异场景无交接但共享角色(cast 兼容:cur ⊆ prev)→ shared-cast', () => {
     const r = planShotRelay(
-      [S(1, { location_id: 'a', characters: ['c1'] }), S(2, { location_id: 'b', characters: ['c1', 'c2'] })],
+      [S(1, { location_id: 'a', characters: ['c1', 'c2'] }), S(2, { location_id: 'b', characters: ['c1'] })],
       { enabled: true },
     );
     expect(r.pairs[0].why).toBe('shared-cast');
@@ -90,6 +99,24 @@ describe('P1-a relay-plan —— 默认关=空计划(保持并行现状)', () =>
     );
     expect(r.pairs).toEqual([]);
     expect(r.hardCuts).toEqual([{ from: 1, to: 2 }]);
+  });
+
+  // 2026-09-23:尾帧里必须有下一镜需要的每一个人 —— prev ⊂ cur 时尾帧缺人,接力=换人
+  it('enabled + prev cast 是 cur 的真子集 → 硬切(prev 尾帧没有 cur 的新人)', () => {
+    const r = planShotRelay(
+      [S(1, { location_id: 'a', characters: ['c1'] }), S(2, { location_id: 'a', characters: ['c1', 'c2'] })],
+      { enabled: true },
+    );
+    expect(r.pairs).toEqual([]);
+    expect(r.hardCuts).toEqual([{ from: 1, to: 2 }]);
+  });
+
+  it('enabled + prev cast 覆盖 cur(cur ⊆ prev)→ 接力(同场景)', () => {
+    const r = planShotRelay(
+      [S(1, { location_id: 'a', characters: ['c1', 'c2'] }), S(2, { location_id: 'a', characters: ['c1'] })],
+      { enabled: true },
+    );
+    expect(r.pairs[0]).toMatchObject({ from: 1, to: 2, why: 'same-location' });
   });
 });
 

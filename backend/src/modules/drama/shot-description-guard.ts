@@ -17,6 +17,16 @@ export const EMPTY_PHRASES = [
 /** 废话开头(镜头表里每行都是镜头,不必再说"这个镜头") */
 export const WASTE_PREFIXES = ['这个镜头', '本镜头', '本镜', '此镜头', '镜头中', '画面中我们'];
 
+/**
+ * 性别名词词表(2026-09-23 身份硬伤):description 写死"男人/女人"会与定妆图
+ * 的性别直接冲突 —— 兜底/文生图路径下模型按文字画,同角色跨镜变性别。
+ * 有参考图时文字与图打架也可能把脸带偏。只 warning 不硬拦(风格剧有合法用法)。
+ */
+export const GENDER_NOUNS = [
+  '男人', '女人', '男子', '女子', '男孩', '女孩', '男性', '女性',
+  '大叔', '大妈', '帅哥', '美女', '青年男', '青年女', '少年', '少女',
+];
+
 /** 中文画面描述最低字数(reelbench minFrameChars=12) */
 export const MIN_DESC_CHARS = 12;
 
@@ -27,7 +37,7 @@ export interface ShotDescLike {
 
 export interface DescViolation {
   idx: number;
-  reason: 'empty' | 'too_short' | 'waste_prefix' | 'duplicate';
+  reason: 'empty' | 'too_short' | 'waste_prefix' | 'duplicate' | 'gender_noun';
   detail: string;
 }
 
@@ -37,6 +47,7 @@ export interface DescViolation {
  * - too_short:去空白后 < MIN_DESC_CHARS
  * - waste_prefix:以废话开头
  * - duplicate:与前面某镜描述一字不差(归一化空白后比较)
+ * - gender_noun:写死性别名词,可能与定妆图/设定冲突(2026-09-23)
  */
 export function checkShotDescriptions(shots: ShotDescLike[]): DescViolation[] {
   if (!Array.isArray(shots)) return [];
@@ -63,6 +74,13 @@ export function checkShotDescriptions(shots: ShotDescLike[]): DescViolation[] {
     if (hitPrefix) {
       violations.push({ idx, reason: 'waste_prefix', detail: `以「${hitPrefix}」开头,直接写画面内容` });
     }
+    const hitGender = GENDER_NOUNS.find((g) => raw.includes(g));
+    if (hitGender) {
+      violations.push({
+        idx, reason: 'gender_noun',
+        detail: `含性别名词「${hitGender}」,与定妆图性别可能冲突 —— 改用角色名或中性描述`,
+      });
+    }
     if (seen.has(norm)) {
       violations.push({ idx, reason: 'duplicate', detail: `与镜头 #${seen.get(norm)} 描述一字不差,写出机位/动作进度差别` });
     } else {
@@ -83,6 +101,7 @@ export function summarizeDescViolations(violations: DescViolation[]): string[] {
   }
   const label: Record<string, string> = {
     empty: '空话描述', too_short: '描述过短', waste_prefix: '废话开头', duplicate: '描述重复',
+    gender_noun: '性别名词硬写',
   };
   return [...byReason.entries()].map(([reason, idxs]) => {
     const uniq = [...new Set(idxs)];

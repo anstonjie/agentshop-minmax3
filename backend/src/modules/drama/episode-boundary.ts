@@ -7,8 +7,10 @@
 // 而不是随便哪一章够秒数就切。
 //
 // ⚠️ 实际装箱在**独立编译的 tool/n2d-core(dist)**,改它要重建 dist 且影响全链路,
-//   风险最高,故 flag 默认关:DRAMA_EPISODE_BOUNDARY=1 才启用,且本模块只做**纯顾问**
-//   (给出建议边界),是否回写账本由调用方决定。启用前务必对已有剧做前后对比验证。
+//   风险最高,故 DRAMA_EPISODE_BOUNDARY **默认关**(=1 才启用),且本模块只做**纯顾问**
+//   (给出建议边界);是否回写账本由调用方决定。注意:repackLedgerEpisodes 目前
+//   **硬编码 enabled:true** 做收尾重排(见下方 planEpisodeBoundaries 调用),与本 flag
+//   解耦 —— flag 只挡"纯顾问"路径。启用前务必对已有剧做前后对比验证。
 // ============================================================================
 
 export interface BoundaryChapterLike {

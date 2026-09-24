@@ -1,6 +1,6 @@
 // shot-description-guard.spec.ts —— P0-b 画面描述质检门(借 reelbench)单测
 import {
-  checkShotDescriptions, summarizeDescViolations, EMPTY_PHRASES, MIN_DESC_CHARS,
+  checkShotDescriptions, summarizeDescViolations, EMPTY_PHRASES, MIN_DESC_CHARS, GENDER_NOUNS,
 } from './shot-description-guard';
 
 describe('checkShotDescriptions —— 每道门都有击穿用例', () => {
@@ -58,6 +58,24 @@ describe('checkShotDescriptions —— 每道门都有击穿用例', () => {
 
   it('非数组 → 空,不抛错', () => {
     expect(checkShotDescriptions(null as any)).toEqual([]);
+  });
+
+  // 2026-09-23 身份:description 写死性别名词会与定妆图冲突 → gender_noun warning
+  it('击穿·性别名词:写死"男人/女人"等 → gender_noun(warning,不硬拦)', () => {
+    const v = checkShotDescriptions([
+      { idx: 5, description: '那个男人推开木门快步走进雨里回头张望' },
+    ]);
+    const g = v.find((x) => x.reason === 'gender_noun');
+    expect(g).toBeDefined();
+    expect(g!.detail).toContain(GENDER_NOUNS[0]);
+    expect(summarizeDescViolations(v).some((x) => x.includes('性别名词'))).toBe(true);
+  });
+
+  it('干净描述用角色名不触发 gender_noun', () => {
+    const v = checkShotDescriptions([
+      { idx: 1, description: '林越推开控制室铁门,手电扫过积灰的值班台' },
+    ]);
+    expect(v.some((x) => x.reason === 'gender_noun')).toBe(false);
   });
 });
 

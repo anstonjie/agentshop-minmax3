@@ -20,6 +20,8 @@ export interface LedgerChapterLike {
 
 /** beats 投影行(与 dramas_novel_beats / ledgerJson.beats 对齐;P0-a 回填后才有) */
 export interface BeatAnchorLike {
+  /** 拍点 id(如 ch1-b1)—— 锚点行首 {id},供大纲 scenes[].beat_ids 引用 */
+  id?: string;
   summary?: string;
   quote?: string;
   must_show?: boolean | number;
@@ -96,8 +98,10 @@ export function formatBeatsAnchor(beats: BeatAnchorLike[]): string {
     const quote = String(b.quote || '').trim();
     if (!summary && !quote) return '';
     const tag = isMust(b) ? '[必拍] ' : '';
+    const id = String(b.id || '').trim();
+    const idBit = id ? `{${id}} ` : '';
     const q = quote ? `:「${quote}」` : '';
-    return `- ${tag}${summary}${q}`;
+    return `- ${idBit}${tag}${summary}${q}`;
   };
   // 必拍排前(稳定:各自保持原相对顺序),让大纲优先核销不可省的剧情点
   const ordered = [...beats].sort((a, b) => Number(isMust(b)) - Number(isMust(a)));

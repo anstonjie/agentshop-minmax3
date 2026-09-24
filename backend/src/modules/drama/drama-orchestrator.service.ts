@@ -33,7 +33,7 @@ import {
   checkBudget, type StepUnits, type UnitPrices,
 } from './drama-pricing';
 import {
-  evaluateComposeGate, composeGateEnabled, composeGateMaxRounds,
+  evaluateComposeGate, composeGateEnabled, composeGateMaxRounds, planFrozenRemake,
 } from './compose-gate';
 
 /** 房间键:与 usage taskId 命名空间共存但不会撞(usage 用的是 uuid 纯串) */
@@ -73,8 +73,13 @@ export function shouldBlockOnDegraded(keyframeOutput: any): boolean {
   const kfs = Array.isArray(keyframeOutput?.keyframes) ? keyframeOutput.keyframes : [];
   const drawn = kfs.filter((k: any) => k?.url); // 只算真的出图了的
   if (!drawn.length) return false;             // 一张图都没有是另一种失败,不归这里管
-  const degraded = drawn.filter((k: any) => k?.degraded === true).length;
-  return degraded / drawn.length >= DEGRADED_RATIO_BLOCK;
+  // 2026-09-24:身份风险双口径 —— degraded(零参考图)与 unanchored_characters
+  //   (场景图活着但角色无 sent ref)都是换脸入口;同镜只算一次。
+  const unsafe = drawn.filter((k: any) => {
+    const un = Array.isArray(k?.unanchored_characters) ? k.unanchored_characters : [];
+    return k?.degraded === true || un.length > 0;
+  }).length;
+  return unsafe / drawn.length >= DEGRADED_RATIO_BLOCK;
 }
 
 /** 退化闸的说明文案:写进批次时间线 + 集降级原因,用户要看得懂、知道下一步做什么 */
@@ -82,7 +87,12 @@ export function degradedReason(keyframeOutput: any): string {
   const kfs = Array.isArray(keyframeOutput?.keyframes) ? keyframeOutput.keyframes : [];
   const drawn = kfs.filter((k: any) => k?.url);
   const degraded = drawn.filter((k: any) => k?.degraded === true).length;
+  const unanchored = drawn.filter((k: any) => {
+    const un = Array.isArray(k?.unanchored_characters) ? k.unanchored_characters : [];
+    return un.length > 0;
+  }).length;
   return `本集 ${degraded}/${drawn.length} 张关键帧没有参考图(纯文生图),`
+    + `${unanchored}/${drawn.length} 镜有角色未锚定(unanchored),`
     + `继续生成视频会全程换脸,已跳过本集的视频与成片,不烧这部分配额。`
     + `请先到资产库点「一键定妆剩余 N 项」补齐定妆,再回来重做本集。`;
 }
@@ -504,6 +514,7 @@ export class DramaOrchestrator implements OnApplicationBootstrap {
     //   前端露出 + 一键补做(批3)。DRAMA_COMPOSE_GATE=0 可关。
     let gateRounds = 0;
     const gateMaxRounds = composeGateMaxRounds();
+    // 2026-09-24 硬冻自动回炉:每集最多一次(与成片门共用轮数计预算,见下方 step5 处)
     // 步骤 4 是"部分成功"语义:有产出 ≠ 跑完。产出里还有 failed/pending 的镜头时
     // 把 4 从已完成集合里摘掉,让它重进一次把失败镜头补上(已成功的会复用,不重烧)。
     if (doneSteps.has(4) && hasFailedShots((ep.stepData as any)?.['4']?.output)) {
@@ -552,6 +563,8 @@ export class DramaOrchestrator implements OnApplicationBootstrap {
 
     // 2026-09-22:本段内已重试过的步(每步最多补一次,见下方 catch)
     const retriedSteps = new Set<number>();
+    // 2026-09-24:本集硬冻回炉用过即置 true(每集最多自动回炉一次,防反复烧额度)
+    let frozenRemakeUsed = false;
     for (let step = from; step <= to; step++) {
       if (token.cancel) return this.abortSteps(batch, '用户取消');
       if (doneSteps.has(step) && step !== 1) {
@@ -598,6 +611,40 @@ export class DramaOrchestrator implements OnApplicationBootstrap {
         if (step === 4) doneSteps.delete(5);
         // ③ 成片门:存活镜/时长不达标且还有轮数 → 回 step4 补做后重合成;
         //    轮数耗尽仍不达标才交片(日志明示,前端缺镜露出 + 一键补做见批3)
+        // 2026-09-24 硬冻自动回炉:audit 点名到镜号的硬冻镜(非近静止,见 planFrozenRemake),
+        //    即使门已过也回炉 —— 冻镜在成片里是"会动的定格",门比例拦不住它。
+        //    回炉换 seed(避复现)+ rhythm 兜底换运镜(避原样再冻);复用门轮数计预算。
+        if (step === 5 && !frozenRemakeUsed && composeGateEnabled() && gateRounds < gateMaxRounds) {
+          const frozenTargets = planFrozenRemake(produced?.audit_shots, false);
+          if (frozenTargets.length) {
+            frozenRemakeUsed = true;
+            gateRounds++;
+            const fresh = await this.svc.getEpisode(dramaUuid, epNo).catch(() => null);
+            const step4out = this.svc.stepOutputOf(fresh || ep, 4) || {};
+            const shots4 = Array.isArray(step4out.shots) ? step4out.shots : [];
+            const patched = {
+              ...step4out,
+              shots: shots4.map((s: any) => frozenTargets.includes(Number(s?.shot_idx))
+                ? {
+                  ...s, video_url: null, status: 'failed',
+                  error: 'frozen auto-remake:硬冻回炉(换 seed + 运镜兜底重烧)',
+                }
+                : s),
+            };
+            await this.svc.updateStepOutput(dramaUuid, epNo, 4, patched);
+            doneSteps.delete(4);
+            doneSteps.delete(5);
+            const msg = `硬冻镜自动回炉 ${frozenTargets.map((i) => `#${i}`).join('、')}`
+              + `(${gateRounds}/${gateMaxRounds})`;
+            this.logger.warn(`批次 ${batch.uuid} EP${epNo} ${msg}`);
+            await this.svc.appendBatchLog(batch.uuid, {
+              ep: epNo, step: 5, ok: false, msg, credits: 0,
+            });
+            this.emitStep(batch, epNo, 5, 'degraded', state.spent, state.budget, msg);
+            step = 3; // for++ 后回到 step4(成功镜复用,只重烧硬冻镜)
+            continue;
+          }
+        }
         if (step === 5 && composeGateEnabled()) {
           const verdict = evaluateComposeGate(produced, state.epTargetSec);
           if (!verdict.passed && gateRounds < gateMaxRounds) {
@@ -730,12 +777,22 @@ export class DramaOrchestrator implements OnApplicationBootstrap {
         const ok = all.filter((s: any) => s.video_url).length;
         const bad = all.filter((s: any) => s?.status === 'failed').length;
         // 失败必须写在时间线上 —— 成片会缺这几段,用户要在日志里看得到
-        return bad ? `视频 ${ok} 段(失败 ${bad} 段,成片将缺这几镜)` : `视频 ${ok} 段`;
+        // 2026-09-24:点名到镜号(之前只有计数,11 号镜之死查了半天)
+        const badIdx = all
+          .filter((s: any) => s?.status === 'failed' && Number.isFinite(Number(s?.shot_idx)))
+          .map((s: any) => `#${Number(s.shot_idx)}`)
+          .join('、');
+        return bad ? `视频 ${ok} 段(失败 ${bad} 段${badIdx ? `:${badIdx}` : ''},成片将缺这几镜)` : `视频 ${ok} 段`;
       }
       case 5: {
         const missing = Number(produced.missing_shots) || 0;
+        const failedList = Array.isArray(produced.failed_shots) ? produced.failed_shots : [];
+        const named = failedList
+          .filter((f: any) => Number.isFinite(Number(f?.shot_idx)))
+          .map((f: any) => `#${Number(f.shot_idx)}(${String(f.reason || f.status || '').slice(0, 40)})`)
+          .join('、');
         return `成片 ${produced.final_url || ''}` +
-          (missing ? ` · 缺 ${missing} 镜` : '');
+          (missing ? ` · 缺 ${missing} 镜${named ? `:${named}` : ''}` : '');
       }
       default: return '完成';
     }

@@ -3,6 +3,9 @@ import {
   composeGateEnabled,
   composeGateMaxRounds,
   composeGateMinDurationSec,
+  failedShotDetails,
+  summarizeFailedShots,
+  planFrozenRemake,
   COMPOSE_GATE_MIN_RATIO,
 } from './compose-gate';
 
@@ -64,9 +67,74 @@ describe('compose-gate 成片门', () => {
   it('env 开关与轮数:DRAMA_COMPOSE_GATE=0 关拦截;轮数默认 2 可覆盖', () => {
     expect(composeGateEnabled({} as any)).toBe(true);
     expect(composeGateEnabled({ DRAMA_COMPOSE_GATE: '0' } as any)).toBe(false);
-    expect(composeGateEnabled({ DRAMA_COMPOSE_GATE: '1' } as any)).toBe(true);
+    expect(composeGateEnabled({ DRAMA_COMPOSE_GATE: '1' } as any )).toBe(true);
     expect(composeGateMaxRounds({} as any)).toBe(2);
     expect(composeGateMaxRounds({ DRAMA_COMPOSE_GATE_ROUNDS: '0' } as any)).toBe(0);
     expect(composeGateMaxRounds({ DRAMA_COMPOSE_GATE_ROUNDS: 'x' } as any)).toBe(2);
+  });
+});
+
+describe('failedShotDetails 缺镜点名(2026-09-24)', () => {
+  it('无 video_url 的镜头进清单,带状态与截断短因', () => {
+    const out = failedShotDetails([
+      { shot_idx: 10, video_url: 'http://x/10.mp4', status: 'completed' },
+      { shot_idx: 11, video_url: null, status: 'failed', error: 'Agnes video create HTTP 503: {"code":"video_queue_full","message":"balabala"}' },
+      { shot_idx: 12, video_url: null, status: 'skipped', reason: 'no keyframe' },
+      { shot_idx: 13, video_url: null, status: 'pending' },
+    ]);
+    expect(out).toHaveLength(3);
+    expect(out[0].shot_idx).toBe(11);
+    expect(out[0].status).toBe('failed');
+    expect(out[0].reason).toContain('503');
+    expect(out[0].reason.length).toBeLessThanOrEqual(120);
+    expect(out[1]).toEqual({ shot_idx: 12, status: 'skipped', reason: 'no keyframe' });
+    expect(out[2].status).toBe('pending');
+  });
+
+  it('全成功 → 空清单;脏输入不炸', () => {
+    expect(failedShotDetails([
+      { shot_idx: 1, video_url: 'http://x/1.mp4', status: 'completed' },
+    ])).toEqual([]);
+    expect(failedShotDetails(null)).toEqual([]);
+    expect(failedShotDetails(undefined)).toEqual([]);
+    expect(failedShotDetails('nope' as any)).toEqual([]);
+    // 无 shot_idx 的条目跳过(下游按镜号补做,没号点不了名)
+    expect(failedShotDetails([{ video_url: null, status: 'failed' }])).toEqual([]);
+  });
+
+  it('reason 换行/超长被压成一行短因', () => {
+    const out = failedShotDetails([
+      { shot_idx: 3, video_url: null, status: 'failed', error: 'line1\nline2\n' + 'x'.repeat(500) },
+    ]);
+    expect(out[0].reason).not.toContain('\n');
+    expect(out[0].reason.length).toBeLessThanOrEqual(120);
+  });
+
+  it('summarizeFailedShots 压成时间线一句话', () => {
+    expect(summarizeFailedShots([])).toBe('');
+    const s = summarizeFailedShots([
+      { shot_idx: 11, status: 'failed', reason: 'Agnes video create HTTP 503' },
+      { shot_idx: 12, status: 'skipped', reason: 'no keyframe' },
+    ]);
+    expect(s).toContain('#11');
+    expect(s).toContain('#12');
+    expect(s).toContain('503');
+  });
+});
+
+describe('planFrozenRemake 硬冻自动回炉(2026-09-24)', () => {
+  it('只回炉硬冻(frozen),近静止(static)仅提示不自动烧额度', () => {
+    expect(planFrozenRemake({ static: [2, 5], frozen: [7] }, false)).toEqual([7]);
+    expect(planFrozenRemake({ static: [2, 5], frozen: [] }, false)).toEqual([]);
+  });
+  it('本轮已回炉过 → 空(防同集反复烧)', () => {
+    expect(planFrozenRemake({ static: [], frozen: [7] }, true)).toEqual([]);
+  });
+  it('去重排序;脏输入不炸', () => {
+    expect(planFrozenRemake({ frozen: [7, 3, 7] }, false)).toEqual([3, 7]);
+    expect(planFrozenRemake(null, false)).toEqual([]);
+    expect(planFrozenRemake(undefined, false)).toEqual([]);
+    expect(planFrozenRemake({}, false)).toEqual([]);
+    expect(planFrozenRemake({ frozen: 'x' as any }, false)).toEqual([]);
   });
 });

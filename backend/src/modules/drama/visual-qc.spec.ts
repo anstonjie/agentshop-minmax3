@@ -12,6 +12,46 @@ describe('visual-qc —— 定妆图质检门(2026-09-16 批4)', () => {
     expect(buildVisualQcQuestion('苍狼谷', 'location')).toContain('场景');
   });
 
+  // 2026-09-23 回归:服装卡里出现人的头像(应只有衣服本身)
+  it('服装 kind 标签是「服装」,且质检问题点名"出现人物即硬伤"', () => {
+    const q = buildVisualQcQuestion('米白衬衫', 'wardrobe');
+    expect(q).toContain('服装');
+    expect(q).toContain('米白衬衫');
+    expect(q).toContain('出现任何人物');
+    expect(VISUAL_QC_SYS).toContain('服装设定图中出现人物');
+  });
+
+  it('载具 kind 标签是「载具」,不再误标成道具', () => {
+    expect(buildVisualQcQuestion('渔船', 'vehicle')).toContain('载具');
+  });
+
+  // 2026-09-23 批5:QC 只检第 1 张视图且不带 angle → 背面画成正面检不出
+  it('带 angle 时点名视图,背面图出现正脸五官判硬伤', () => {
+    const q = buildVisualQcQuestion('洛烛', 'character', '背面');
+    expect(q).toContain('背面');
+    expect(q).toContain('正脸');
+  });
+
+  it('不带 angle 仍可用(向后兼容,不出现 undefined 字样)', () => {
+    const q = buildVisualQcQuestion('洛烛', 'character');
+    expect(q).not.toContain('undefined');
+    expect(q).not.toContain('「」');
+  });
+
+  // 2026-09-23 批5:turnaround 多人合影是历史坑,QC 一直检不出
+  it('角色质检要求恰好一名角色,多人合影判硬伤', () => {
+    const q = buildVisualQcQuestion('洛烛', 'character');
+    expect(q).toContain('恰好一名');
+    expect(VISUAL_QC_SYS).toContain('合影');
+  });
+
+  // 2026-09-23 批5:场景路人 / 载具司机经资产参考图带进关键帧,QC 一直检不出
+  it('场景/载具质检:出现人物(路人/司机乘客)即硬伤', () => {
+    expect(buildVisualQcQuestion('雨夜码头', 'location')).toContain('路人');
+    expect(buildVisualQcQuestion('渔船', 'vehicle')).toContain('驾驶员');
+    expect(VISUAL_QC_SYS).toContain('载具');
+  });
+
   it('解析正常 JSON', () => {
     expect(parseVisualQcVerdict('{"ok": false, "issues": ["三条胳膊", "六指"]}'))
       .toEqual({ ok: false, issues: ['三条胳膊', '六指'] });

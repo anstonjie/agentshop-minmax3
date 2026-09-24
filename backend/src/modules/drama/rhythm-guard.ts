@@ -131,11 +131,12 @@ export function rhythmPromptGuide(): string {
   不许用 close/breath 把集尾收平(连续剧"连"的镜头级载体)`;
 }
 
-// ── 集尾钩子镜头硬门(2026-09-16 批2) ────────────────────────────────────────
+// ── 集尾钩子镜头硬门(2026-09-16 批2;2026-09-23 空过作废) ──────────────────
 // 诊断:hookIn/hookOut 只活在大纲文本层,镜头层没有任何强制 —— 每集结尾
 // 经常是一个收口/换气镜,悬念没有画面载体,下一集开场自然"接不上"。
-// 门语义:最后一镜 rhythm ∈ END_HOOK_ROLES;整集完全没标 rhythm 时不拦
-// (可选字段,避免把老数据/降级路径误杀)。
+// 门语义:最后一镜 rhythm ∈ END_HOOK_ROLES。
+// 2026-09-23:整集完全没标 rhythm **也拦** —— 旧"空过"让降级路径永远
+// 无法确认集尾钩子,等于门形同虚设;spec 同步改为拦。
 
 /** 集尾钩子镜允许的节奏角色:转折/兑现/钩子都留得住人;close/breath 会把集尾收平 */
 export const END_HOOK_ROLES: RhythmRole[] = ['turn', 'payoff', 'hook'];
@@ -153,7 +154,14 @@ export function checkEpisodeEndHook(shots: RhythmShotLike[]): EndHookVerdict {
   }
   const lastIdx = Number(shots[shots.length - 1]?.idx ?? shots.length - 1);
   const anyTagged = shots.some((s) => normalizeRhythm(s?.rhythm) !== null);
-  if (!anyTagged) return { ok: true, lastRole: null, lastIdx, reason: null };
+  if (!anyTagged) {
+    return {
+      ok: false,
+      lastRole: null,
+      lastIdx,
+      reason: `整集未标 rhythm,无法确认集尾钩子(末镜 #${lastIdx}) —— 请让分镜补标`,
+    };
+  }
   const role = normalizeRhythm(shots[shots.length - 1]?.rhythm);
   if (role && (END_HOOK_ROLES as readonly string[]).includes(role)) {
     return { ok: true, lastRole: role, lastIdx, reason: null };

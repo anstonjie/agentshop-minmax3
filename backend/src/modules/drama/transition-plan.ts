@@ -4,9 +4,9 @@
 // 诊断根因 B:genStep7Compose 是 `concat -c copy` 裸硬拼,镜头间零过渡 = 破碎感来源。
 // 本模块把"用裸拼还是叠化"做成纯函数决策,由 flag 门控(默认关 = 完全保持现状)。
 //
-// ⚠️ 改的是正在工作的合成路径,故默认关:DRAMA_COMPOSE_TRANSITIONS=1 才启用 xfade。
-//   xfade 需要重编码 + 各片段同分辨率/帧率/像素格式(咱们的 i2v 片段满足),
-//   启用后务必先跑一集真实验证再放量。
+// ⚠️ 改的是正在工作的合成路径。2026-09-16 起 open-montage.genStep7Compose **默认开**
+//   xfade(DRAMA_COMPOSE_TRANSITIONS=0 可关);本模块仍保留 enabled=false 的裸拼分支,
+//   供测试与回滚。启用后务必先跑一集真实验证再放量。
 // ============================================================================
 
 export type TransitionKind = 'cut' | 'fade' | 'dissolve' | 'wipe';

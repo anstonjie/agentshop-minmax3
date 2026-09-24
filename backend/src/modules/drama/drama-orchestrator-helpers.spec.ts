@@ -94,6 +94,44 @@ describe('shouldBlockOnDegraded —— 退化到什么程度才拦下本集', ()
   it('degraded 字段缺失按"没退化"算,不误拦', () => {
     expect(shouldBlockOnDegraded({ keyframes: [{ url: 'a' }, { url: 'b' }] })).toBe(false);
   });
+
+  // 2026-09-24:场景图活着、角色无 ref → degraded=false 但仍 unanchored(换脸风险)。
+  // 旧门只看 degraded,这类"半退化"静默放行进视频。
+  it('unanchored_characters 非空也算身份风险,与 degraded 同口径进比例门', () => {
+    const out = {
+      keyframes: [
+        { url: 'a', degraded: false, unanchored_characters: ['c1'] },
+        { url: 'b', degraded: false, unanchored_characters: ['c2'] },
+        { url: 'c', degraded: false },
+        { url: 'd', degraded: false },
+      ],
+    };
+    expect(shouldBlockOnDegraded(out)).toBe(true);
+  });
+
+  it('仅 1/4 镜 unanchored → 放行(与 degraded 0.5 阈值同口径)', () => {
+    const out = {
+      keyframes: [
+        { url: 'a', degraded: false, unanchored_characters: ['c1'] },
+        { url: 'b', degraded: false },
+        { url: 'c', degraded: false },
+        { url: 'd', degraded: false },
+      ],
+    };
+    expect(shouldBlockOnDegraded(out)).toBe(false);
+  });
+
+  it('degraded 与 unanchored 同镜只算一次(不双计)', () => {
+    const out = {
+      keyframes: [
+        { url: 'a', degraded: true, unanchored_characters: ['c1'] },
+        { url: 'b', degraded: false },
+        { url: 'c', degraded: false },
+        { url: 'd', degraded: false },
+      ],
+    };
+    expect(shouldBlockOnDegraded(out)).toBe(false); // 1/4,不是 2/4
+  });
 });
 
 describe('degradedReason —— 给用户的说明必须能指导下一步', () => {

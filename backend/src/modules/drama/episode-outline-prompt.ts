@@ -49,6 +49,9 @@ const KIND_LABEL: Record<string, string> = {
   character: '角色', location: '场景', prop: '道具', vehicle: '载具', wardrobe: '服装',
 };
 
+/** needs_assets.kind 白名单 —— 与 DramaService.ASSET_KINDS 对齐;非法 kind 到 createAsset 抛 400 会让 resolvePrecheck 中途断 */
+export const OUTLINE_ASSET_KINDS = ['character', 'location', 'prop', 'vehicle', 'wardrobe'];
+
 export function buildEpisodeOutlinePrompt(
   input: EpisodeOutlineInput,
 ): EpisodeOutlinePrompt {
@@ -67,15 +70,17 @@ export function buildEpisodeOutlinePrompt(
 硬性要求:
 - 严格输出 JSON,不要 markdown 包裹,不要复述设定内容
 - **不得与「已确立事实」冲突**:已经死掉的人不能复活、已经拿到的证据不能又找不到、已经知道秘密的人不能突然不知道
-${hasAnchor ? `- **忠于原著(最高优先)**:下面给了本集的「原文锚点/原文摘录」,scenes 必须据此改编 —— 覆盖所有标 [必拍] 的点,不得凭空另编主线、不得与原文既定情节矛盾;锚点里用「」括起的台词是原文逐字,改编时优先保留其含义` : ''}${hasAnchor ? `
+${hasAnchor ? `- **忠于原著(最高优先)**:下面给了本集的「原文锚点/原文摘录」,scenes 必须据此改编 —— 覆盖所有标 [必拍] 的点,不得凭空另编主线、不得与原文既定情节矛盾;锚点里用「」括起的台词是原文逐字,改编时优先保留其含义
+- **beat 1:1 映射**:每个 scene 必须给 beat_ids(本场覆盖的拍点 id,见锚点行首 {id});所有 [必拍] 拍点必须被至少一个 scene 的 beat_ids 覆盖。**禁止为凑时长发明锚点/摘录里没有的新主线情节** —— 内容不够就把已有拍点写深(动作/冲突/反应/后果),而不是另编剧情` : ''}${hasAnchor ? `
 - **逐字引用(quotes 字段)**:每个 scene 必须给 quotes:本场改编自的 1-3 条**原文逐字句**(从锚点「」内或摘录原文里原样抄录,不许改写);纯衔接场确无对应原文才允许空数组。quotes 是分镜/字幕回溯原著的唯一载体,缺了它下游就只能凭 50 字摘要重编` : ''}- 开场必须自然接住「本集要接住的钩子」,不许另起炉灶忽略它
 - 结尾必须留下「本集结尾钩子」,它是下一集的开场
 - 出场人物、场景、道具**优先复用资产索引里已有的 slug**;确有必要才新增,新增时在 needs_assets 里写清视觉描述
-- needs_assets 每项必须给 kind/name/slug(英文小写下划线)/descVisual;角色 descVisual 写长相发型服装,场景写光线材质氛围
+- needs_assets 每项必须给 kind/name/slug(英文小写下划线)/descVisual;kind 只能是 ${OUTLINE_ASSET_KINDS.join('|')};
+  角色 descVisual 写长相发型服装,场景写光线材质氛围(空景,不写路人),道具/载具写外观结构,服装只写衣服本身的版型/颜色/面料(禁止写谁在穿)
 - scenes 3-6 个,每个给 estimated_sec 与 summary(50 字内)
 - **所有 scene 的 estimated_sec 之和 + total_estimated_sec 必须接近本集目标时长**,
-  上下浮动不超过 15%。不要因为"剧情写完了"就提前收尾 —— 内容不够就把场景写足、
-  把冲突写透,而不是交一个比目标短一半的本子
+  上下浮动不超过 15%。时长不够时**只允许深化已有场景/拍点(写透冲突与反应),禁止发明与原文、使命无关的新主线来凑秒数**;
+  宁可场景节奏放慢,也不要交一个比目标短一半、或东拼西凑看不懂的本子
 - 每个 scene 的 description 只写构图/动作/环境/光线,**禁止写人物长相与服装**(那由定妆图决定)
 - 不要出现旁白解释前情,用画面和动作承接`;
 
@@ -132,10 +137,13 @@ ${hasAnchor ? `- **忠于原著(最高优先)**:下面给了本集的「原文�
   "scenes": [
     { "idx": 1, "location": "地点", "summary": "50字内", "estimated_sec": 30,
       "characters": ["<角色slug>"], "props": ["<道具slug>"],
+      "vehicles": ["<载具slug>,本场出现时才写,可省略"],
+      "wardrobe": ["<服装slug>,本场特殊造型时才写,可省略"],
+      "beat_ids": ["锚点行首的拍点id;无锚点时省略或空数组"],
       "quotes": ["本场改编自的原文逐字句(从锚点原样抄录,1-3条;纯衔接场可空)"] }
   ],
   "needs_assets": [
-    { "kind": "character|location|prop", "name": "中文名", "slug": "english_slug",
+    { "kind": "character|location|prop|vehicle|wardrobe", "name": "中文名", "slug": "english_slug",
       "descVisual": "视觉描述(供定妆)", "descPersona": "人设或用途",
       "variantHint": "若是已有角色的新造型,写造型名,否则留空" }
   ]
@@ -160,21 +168,41 @@ export function normalizeEpisodeOutline(raw: any): { outline: any; warnings: str
     if (typeof s.estimated_sec !== 'number') s.estimated_sec = 30;
     if (!Array.isArray(s.characters)) s.characters = [];
     if (!Array.isArray(s.props)) s.props = [];
+    // 2026-09-24:载具/服装与 characters/props 同路径归一 —— collectNeeds / 分镜靠它扫
+    if (!Array.isArray(s.vehicles)) s.vehicles = [];
+    s.vehicles = Array.from(new Set(
+      s.vehicles.map((v: any) => String(v || '').trim()).filter((v: string) => v),
+    ));
+    if (!Array.isArray(s.wardrobe)) s.wardrobe = [];
+    s.wardrobe = Array.from(new Set(
+      s.wardrobe.map((w: any) => String(w || '').trim()).filter((w: string) => w),
+    ));
     // 2026-09-16(批2):quotes 归一 —— 逐字锚点的唯一载体,下游分镜/coverage 都靠它
     if (!Array.isArray(s.quotes)) s.quotes = [];
     s.quotes = Array.from(new Set(
       s.quotes.map((q: any) => String(q || '').trim()).filter((q: string) => q),
     )).slice(0, 3);
+    // 2026-09-23:beat_ids 归一 —— 场景↔原文拍点 1:1 映射,coverage/分镜回溯用
+    if (!Array.isArray(s.beat_ids)) s.beat_ids = [];
+    s.beat_ids = Array.from(new Set(
+      s.beat_ids.map((b: any) => String(b || '').trim()).filter((b: string) => b),
+    )).slice(0, 8);
   });
   if (!out.scenes.length) warnings.push('LLM 未返回任何场景,本集大纲不可用');
 
   const needs: any[] = [];
   const seenSlug = new Set<string>();
   for (const n of Array.isArray(out.needs_assets) ? out.needs_assets : []) {
-    const kind = String(n.kind || '').trim();
+    let kind = String(n.kind || '').trim().toLowerCase();
     const name = String(n.name || '').trim();
     let slug = String(n.slug || '').trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_');
     if (!kind || !name) { warnings.push(`跳过一条缺 kind/name 的资产需求:${JSON.stringify(n).slice(0, 60)}`); continue; }
+    // 2026-09-23 批5:非法 kind 流到 createAsset 会抛 400,resolvePrecheck 中途断且
+    // 已应用的裁决无事务回滚 —— 在 normalize 层先拦下并告警
+    if (!OUTLINE_ASSET_KINDS.includes(kind)) {
+      warnings.push(`跳过 kind「${kind}」不在白名单(${OUTLINE_ASSET_KINDS.join('/')})的资产需求「${name}」`);
+      continue;
+    }
     if (!slug) {
       // 不静默丢弃:补一个可追溯的临时 slug,同时告警,让前端能提示改写
       slug = `${kind.slice(0, 4)}_auto_${needs.length + 1}`;
@@ -221,4 +249,23 @@ export function outlineQuoteStats(outline: any): {
     for (const q of qs) if (!quotes.includes(q)) quotes.push(q);
   }
   return { scenes: scenes.length, withQuotes, quotes };
+}
+
+/**
+ * 2026-09-24:场景引用的扁平化口径 —— collectNeeds 的 appearsIn 过滤与
+ * 场景级资产扫描共用这一处,避免再出现"只扫 characters/props"的半截实现。
+ * 顺序:角色 → 道具 → 载具 → 服装 → 场景 id → 场景自由文本。
+ */
+export function sceneAssetSlugs(sc: any): string[] {
+  if (!sc || typeof sc !== 'object') return [];
+  const pick = (v: unknown): string[] =>
+    Array.isArray(v) ? v.map((x) => String(x ?? '').trim()).filter(Boolean) : [];
+  return [
+    ...pick(sc.characters),
+    ...pick(sc.props),
+    ...pick(sc.vehicles),
+    ...pick(sc.wardrobe),
+    ...(sc.location_id ? [String(sc.location_id).trim()] : []),
+    ...(sc.location ? [String(sc.location).trim()] : []),
+  ].filter(Boolean);
 }

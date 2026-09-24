@@ -11,7 +11,8 @@
 //   4: 分镜脚本     (LLM 把剧本拆为 shots)
 //   5: 分镜关键帧   (AGNES image 为每个 shot 生成 keyframe)
 //   6: 分镜视频     (AGNES video 为每个 shot 生成视频)
-//   7: 合成视频     (ffmpeg 拼接 + 字幕/BGM/TTS)
+//   7: 合成视频     (ffmpeg 拼接 + xfade 转场 + ASS/SRT 字幕烧录 + 音轨拼接;
+//                    台词音轨来自 Agnes i2v 片段自带 AAC,无独立 TTS/BGM 混音)
 //
 // 通用接口:
 //   POST   /api/open-montage/sessions                     创建会话

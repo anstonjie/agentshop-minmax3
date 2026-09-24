@@ -57,6 +57,39 @@ describe('pickUsableRef', () => {
     const a = asset({ slug: 'char_x', refs: [{ remoteUrl: 'data:image/png;base64,AAAA', alive: true }] });
     expect(pickUsableRef(a)).toBeNull();
   });
+
+  // 2026-09-24 换装一致性:shot 带 wardrobe 时,角色应优先用匹配 variant 的定妆,
+  // 否则换装镜仍锚基础造型 → 镜头间衣服闪回
+  it('给定 variantLabels 时优先取匹配变体的存活参考图', () => {
+    const a = asset({
+      slug: 'char_x', name: '林越',
+      refs: [{ angle: '正面', remoteUrl: REMOTE, alive: true, canonical: true }],
+      variants: [{
+        id: 'wd_coat', label: '风衣',
+        refs: [{ angle: '全身', remoteUrl: REMOTE2, alive: true, canonical: true }],
+      }],
+    });
+    expect(pickUsableRef(a, { variantLabels: ['风衣'] })).toBe(REMOTE2);
+    expect(pickUsableRef(a, { variantLabels: ['wd_coat'] })).toBe(REMOTE2);
+  });
+
+  it('variant 无存活图时回退基础 refs,不返回 null', () => {
+    const a = asset({
+      slug: 'char_x',
+      refs: [{ angle: '正面', remoteUrl: REMOTE, alive: true, canonical: true }],
+      variants: [{ id: 'v1', label: '婚纱', refs: [{ remoteUrl: '/uploads/dead.png', alive: true }] }],
+    });
+    expect(pickUsableRef(a, { variantLabels: ['婚纱'] })).toBe(REMOTE);
+  });
+
+  it('未给 variantLabels 时行为与旧版一致(只读基础 refs)', () => {
+    const a = asset({
+      slug: 'char_x',
+      refs: [{ angle: '正面', remoteUrl: REMOTE, alive: true, canonical: true }],
+      variants: [{ id: 'v1', label: '风衣', refs: [{ remoteUrl: REMOTE2, alive: true }] }],
+    });
+    expect(pickUsableRef(a)).toBe(REMOTE);
+  });
 });
 
 describe('buildKeyframePlan 参考图收集', () => {
@@ -102,6 +135,56 @@ describe('buildKeyframePlan 参考图收集', () => {
     );
     expect(plan.refUrls.filter((u) => u === REMOTE)).toHaveLength(1);
   });
+
+  // 2026-09-24:shot 带 vehicles/wardrobe —— 美术层已有资产,规划层必须能引用
+  it('shot.vehicles / shot.wardrobe 进 slugs;截断时角色+服装优先占满 MAX_REF_IMAGES', () => {
+    const full: Record<string, RefAsset> = {
+      ...lib,
+      veh_boat: asset({ slug: 'veh_boat', name: '渔船', kind: 'vehicle', refs: [{ remoteUrl: 'https://x.test/v.png', alive: true, canonical: true }] }),
+      wd_coat: asset({ slug: 'wd_coat', name: '风衣', kind: 'wardrobe', refs: [{ remoteUrl: 'https://x.test/w.png', alive: true, canonical: true }] }),
+    };
+    const plan = buildKeyframePlan(
+      { ...shot, vehicles: ['veh_boat'], wardrobe: ['wd_coat'] }, full, {},
+    );
+    // 5 个资产都进来源表;上游只收 MAX_REF_IMAGES 张,优先角色/服装/场景
+    expect(plan.refSources.map((r) => r.slug)).toEqual(
+      ['char_linyue', 'wd_coat', 'loc_room', 'veh_boat', 'prop_torch'],
+    );
+    expect(plan.refUrls).toHaveLength(MAX_REF_IMAGES);
+    expect(plan.refUrls).toContain(REMOTE);
+    expect(plan.refUrls).toContain('https://x.test/w.png');
+    expect(plan.refSources.find((r) => r.slug === 'veh_boat')?.sent).toBe(false);
+    expect(plan.missingRefs).toEqual([]);
+    expect(plan.unanchoredCharacters).toEqual([]);
+  });
+
+  it('库内无该载具/服装 → 进 missingRefs 但不标 unanchoredCharacters', () => {
+    const plan = buildKeyframePlan(
+      { ...shot, vehicles: ['veh_unknown'], wardrobe: ['wd_unknown'] }, lib, {},
+    );
+    expect(plan.missingRefs).toEqual(expect.arrayContaining(['veh_unknown', 'wd_unknown']));
+    expect(plan.unanchoredCharacters).toEqual([]);
+  });
+
+  it('shot 带 wardrobe 时角色优先用匹配 variant 定妆图,并记 variant 角度', () => {
+    const costumeLib: Record<string, RefAsset> = {
+      char_linyue: asset({
+        slug: 'char_linyue', name: '林越',
+        refs: [{ angle: '正面', remoteUrl: REMOTE, alive: true, canonical: true }],
+        variants: [{ id: 'wd_coat', label: '风衣', refs: [{ angle: '全身', remoteUrl: REMOTE2, alive: true, canonical: true }] }],
+      }),
+      wd_coat: asset({ slug: 'wd_coat', name: '风衣', kind: 'wardrobe', refs: [{ remoteUrl: 'https://x.test/garment.png', alive: true, canonical: true }] }),
+    };
+    const plan = buildKeyframePlan(
+      { idx: 1, description: '穿风衣出门', characters: ['char_linyue'], wardrobe: ['wd_coat'] },
+      costumeLib, {},
+    );
+    const charSrc = plan.refSources.find((r) => r.slug === 'char_linyue');
+    expect(charSrc?.url).toBe(REMOTE2);
+    expect(charSrc?.angle).toContain('风衣');
+    expect(plan.refUrls).toContain(REMOTE2);
+    expect(plan.refUrls).toContain('https://x.test/garment.png');
+  });
 });
 
 describe('buildKeyframePlan 提示词构造', () => {
@@ -125,6 +208,17 @@ describe('buildKeyframePlan 提示词构造', () => {
     expect(buildKeyframePlan(shot, withRef, {}).prompt).toContain('camera 跟');
     expect(buildKeyframePlan({ ...shot, camera_motion: '静止' }, withRef, {}).prompt)
       .not.toContain('camera');
+  });
+
+  it('纯时间类运镜(焦点切换/穿拍)静图跳过,构图类(过肩/俯拍)仍写', () => {
+    expect(buildKeyframePlan({ ...shot, camera_motion: '焦点切换' }, withRef, {}).prompt)
+      .not.toContain('camera 焦点切换');
+    expect(buildKeyframePlan({ ...shot, camera_motion: '穿拍' }, withRef, {}).prompt)
+      .not.toContain('camera 穿拍');
+    expect(buildKeyframePlan({ ...shot, camera_motion: '过肩' }, withRef, {}).prompt)
+      .toContain('camera 过肩');
+    expect(buildKeyframePlan({ ...shot, camera_motion: '俯拍' }, withRef, {}).prompt)
+      .toContain('camera 俯拍');
   });
 
   it('风格圣经逐段拼进提示词,保证全剧同调', () => {
@@ -157,10 +251,81 @@ describe('buildKeyframePlan 提示词构造', () => {
     expect(plan.prompt).toContain('女刑警推开控制室铁门');
   });
 
+  it('纯 wardrobe/vehicle 镜(无角色)不因缺 ref 标 unanchoredCharacters', () => {
+    const plan = buildKeyframePlan(
+      { idx: 1, description: '风衣特写', wardrobe: ['wd_none'], vehicles: ['veh_none'] },
+      {}, {},
+    );
+    expect(plan.unanchoredCharacters).toEqual([]);
+    expect(plan.missingRefs).toEqual(expect.arrayContaining(['wd_none', 'veh_none']));
+  });
+
   it('negative 始终含防串脸约束', () => {
     const plan = buildKeyframePlan(shot, withRef, { negativePrompt: '文字水印' });
     expect(plan.negative).toContain('different face');
     expect(plan.negative).toContain('文字水印');
+  });
+});
+
+// ============================================================================
+// 2026-09-23 身份硬伤:unanchoredCharacters —— 有场景图但角色无参考图时,
+// 角色必须仍拿到文字外貌锚 + unanchored 记录,否则每镜重新发明一个人。
+// ============================================================================
+describe('buildKeyframePlan 身份锚(2026-09-23)', () => {
+  const locOnly: Record<string, RefAsset> = {
+    loc_room: asset({ slug: 'loc_room', name: '灯塔控制室', kind: 'location', refs: [{ remoteUrl: REMOTE2, alive: true, canonical: true }] }),
+    char_linyue: asset({ slug: 'char_linyue', name: '林越', descVisual: '短发女性, 藏青风衣', refs: [] }),
+  };
+
+  it('场景图活着但角色无 ref → degraded=false 仍注入角色外貌 + unanchoredCharacters 点名', () => {
+    const plan = buildKeyframePlan(
+      { idx: 1, description: '推门进入控制室', characters: ['char_linyue'], location_id: 'loc_room' },
+      locOnly, {},
+    );
+    expect(plan.degraded).toBe(false);
+    expect(plan.unanchoredCharacters).toEqual(['char_linyue']);
+    expect(plan.prompt).toContain('短发女性');
+    expect(plan.prompt).toContain('keep this character identity and gender stable');
+    expect(plan.refSources.find((r) => r.slug === 'loc_room')?.kind).toBe('location');
+  });
+
+  it('角色有 sent ref → 不进 unanchored,且不复述其外貌(与参考图打架)', () => {
+    const lib: Record<string, RefAsset> = {
+      char_linyue: asset({ slug: 'char_linyue', refs: [{ remoteUrl: REMOTE, alive: true, canonical: true }] }),
+      loc_room: asset({ slug: 'loc_room', kind: 'location', refs: [{ remoteUrl: REMOTE2, alive: true, canonical: true }] }),
+    };
+    const plan = buildKeyframePlan(
+      { idx: 1, description: '推门', characters: ['char_linyue'], location_id: 'loc_room' },
+      lib, {},
+    );
+    expect(plan.unanchoredCharacters).toEqual([]);
+    expect(plan.prompt).not.toContain('短发女性');
+  });
+
+  it('角色被 MAX_REF_IMAGES 截断(sent=false)→ 记入 unanchoredCharacters', () => {
+    const many: Record<string, RefAsset> = {
+      loc_room: asset({ slug: 'loc_room', kind: 'location', refs: [{ remoteUrl: REMOTE2, alive: true, canonical: true }] }),
+      prop_a: asset({ slug: 'prop_a', kind: 'prop', refs: [{ remoteUrl: 'https://x.test/a.png', alive: true, canonical: true }] }),
+    };
+    // chars 先于 loc/props 入队,但截断发生在 ref 槽满后 —— 用大量优先角色把 char 挤出去不可行
+    // (characters 在 slugs 最前)。这里验证:库内不认识的 character 进 unanchored;
+    // 真正的截断场景由 slugs 顺序保证角色优先占槽。
+    many.char_missing = asset({ slug: 'char_missing', refs: [] });
+    const plan = buildKeyframePlan(
+      { idx: 1, description: '群戏', characters: ['char_missing'], location_id: 'loc_room', props: ['prop_a'] },
+      many, {},
+    );
+    expect(plan.unanchoredCharacters).toContain('char_missing');
+    expect(plan.degraded).toBe(false);
+  });
+
+  it('完全不认识的 character slug(shot.characters 含)→ unanchored + missingRefs', () => {
+    const plan = buildKeyframePlan(
+      { idx: 1, description: 'x', characters: ['char_unknown'], location_id: 'loc_room' },
+      { loc_room: locOnly.loc_room }, {},
+    );
+    expect(plan.unanchoredCharacters).toEqual(['char_unknown']);
+    expect(plan.missingRefs).toContain('char_unknown');
   });
 });
 
@@ -197,6 +362,28 @@ describe('indexLegacyConceptArt', () => {
     );
     expect(plan.refUrls).toEqual([REMOTE]);
     expect(plan.degraded).toBe(false);
+  });
+
+  // 2026-09-23 批5:step3 产出的 vehicles/wardrobe 之前被静默丢弃 ——
+  // 载具/服装资产在关键帧规划里永远"库内不认识"
+  it('step3 的 vehicles/wardrobe 也进索引,不再被静默丢弃', () => {
+    const idx = indexLegacyConceptArt(
+      {
+        vehicles: [{ id: 'veh_boat', name: '渔船', url: REMOTE, prompt: 'vp' }],
+        wardrobe: [{ id: 'wd_coat', name: '风衣', url: REMOTE2, prompt: 'wp' }],
+      },
+      {
+        vehicles: [{ id: 'veh_boat', description: '木质拖网船' }],
+        wardrobe: [{ id: 'wd_coat', description: '卡其风衣' }],
+      },
+    );
+    expect(idx.veh_boat.kind).toBe('vehicle');
+    expect(idx.veh_boat.refs[0].remoteUrl).toBe(REMOTE);
+    expect(idx.veh_boat.refs[0].alive).toBe(true);
+    expect(idx.veh_boat.descVisual).toBe('木质拖网船');
+    expect(idx.wd_coat.kind).toBe('wardrobe');
+    expect(idx.wd_coat.refs[0].remoteUrl).toBe(REMOTE2);
+    expect(idx.wd_coat.descVisual).toBe('卡其风衣');
   });
 });
 

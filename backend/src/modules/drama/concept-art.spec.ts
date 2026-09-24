@@ -6,8 +6,10 @@
 // 整套调优悄悄退回去。这里断言的是结构,不是逐字节文案。
 // ============================================================================
 import {
-  ANGLE_CONFIGS, CONCEPT_SIZES, planAssetShots,
-  buildCharacterViewPrompt, buildScenePrompt, buildPropPrompt,
+  ANGLE_CONFIGS, CONCEPT_SIZES, planAssetShots, planPortraitGeneration,
+  buildCharacterViewPrompt, buildScenePrompt, buildPropPrompt, buildWardrobePrompt,
+  buildVehiclePrompt,
+  WARDROBE_NEGATIVE, VEHICLE_NEGATIVE, PROP_NEGATIVE, LOCATION_NEGATIVE,
   refFileTag, portraitFileTag,
 } from './concept-art';
 
@@ -67,19 +69,52 @@ describe('planAssetShots 每类资产出几张图', () => {
     }
   });
 
-  it('场景 = 1 张横幅 establishing shot,无负向词', () => {
+  // 2026-09-23 批5:场景参考图带路人会经图生图带进关键帧 → 空景约束 + 负向词
+  it('场景 = 1 张横幅 establishing shot,空景无人且带负向词', () => {
     const shots = planAssetShots('location', { name: '码头', description: '雨夜木栈桥' }, '写实');
     expect(shots).toHaveLength(1);
     expect(shots[0].size).toBe(CONCEPT_SIZES.location);
     expect(shots[0].prompt).toContain('wide establishing shot');
-    expect(shots[0].negative).toBe('');
+    expect(shots[0].prompt).toMatch(/empty scene|no people/i);
+    expect(shots[0].negative).toBe(LOCATION_NEGATIVE);
+    expect(shots[0].negative).toMatch(/people|person/i);
   });
 
-  it('道具 = 1 张方图白底产品图', () => {
+  // 2026-09-23 批5:product shot 语料常带手持/人手 → 道具必须带负向词
+  it('道具 = 1 张方图白底产品图,带禁人物/手持的负向词', () => {
     const shots = planAssetShots('prop', { name: '钥匙', description: '黄铜老钥匙' }, '写实');
     expect(shots).toHaveLength(1);
     expect(shots[0].size).toBe(CONCEPT_SIZES.prop);
     expect(shots[0].prompt).toContain('centered on white background');
+    expect(shots[0].negative).toBe(PROP_NEGATIVE);
+    expect(shots[0].negative).toMatch(/hand|people/i);
+    expect(shots[0].prompt).toMatch(/not held|no people|no hands/i);
+  });
+
+  // 2026-09-23 批5:载具落 prop 兜底会画成方图 "prop design",还可能带司机/乘客
+  it('载具 = 1 张横幅专用提示词,禁驾驶员与人物,不落道具兜底', () => {
+    const shots = planAssetShots('vehicle', { name: '渔船', description: '木质拖网船' }, '写实');
+    expect(shots).toHaveLength(1);
+    expect(shots[0].size).toBe(CONCEPT_SIZES.vehicle);
+    expect(shots[0].prompt).toContain('木质拖网船');
+    expect(shots[0].prompt).toMatch(/no driver/i);
+    expect(shots[0].prompt).not.toContain('prop design');
+    expect(shots[0].negative).toBe(VEHICLE_NEGATIVE);
+    expect(shots[0].negative).toMatch(/driver/i);
+    expect(shots[0].negative).toMatch(/people|person/i);
+  });
+
+  // 2026-09-23 回归:服装落道具兜底会画出"模特上身图"(资产库里出现人的头像)
+  it('服装 = 1 张,专用提示词禁人物,且带负向词(不再落道具兜底)', () => {
+    const shots = planAssetShots('wardrobe', { name: '亚麻衬衫', description: '米白色亚麻衬衫,小翻领' }, '写实');
+    expect(shots).toHaveLength(1);
+    expect(shots[0].size).toBe(CONCEPT_SIZES.wardrobe);
+    expect(shots[0].prompt).toContain('clothing only');
+    expect(shots[0].prompt).toContain('no model');
+    expect(shots[0].prompt).toContain('米白色亚麻衬衫');
+    expect(shots[0].prompt).not.toContain('prop design');
+    expect(shots[0].negative).toBe(WARDROBE_NEGATIVE);
+    expect(shots[0].negative).toMatch(/face/i);
   });
 
   it('角色缺 appearance 时回落 description 再回落 name,不产空提示词', () => {
@@ -89,9 +124,59 @@ describe('planAssetShots 每类资产出几张图', () => {
   });
 
   it('未识别的 kind 按道具兜底,而不是静默产 0 张图', () => {
-    const shots = planAssetShots('vehicle', { name: '渔船', description: '木质拖网船' }, '写实');
+    const shots = planAssetShots('gadget', { name: '仪器', description: '黄铜仪器' }, '写实');
     expect(shots.length).toBeGreaterThan(0);
-    expect(shots[0].prompt).toContain('木质拖网船');
+    expect(shots[0].prompt).toContain('黄铜仪器');
+    expect(shots[0].prompt).toContain('prop design');
+  });
+});
+
+// 2026-09-23 批5:refs 顺序错乱 bug —— 复用与待生成交错时,旧实现先 push 复用、
+// 后 push 新画结果,refs 顺序 ≠ shots 顺序 → QC 取 shots[qcIdx] 提示词错位、
+// portraitFileTag(qcIdx) 文件名错、重画用错提示词。必须按下标回填。
+describe('planPortraitGeneration refs 按位回填(防 QC/文件名错位)', () => {
+  const shots = ANGLE_CONFIGS.map((ac) => ({
+    angle: ac.label, prompt: `p-${ac.label}`, negative: '', size: '864x1152',
+  }));
+
+  it('复用(正面/背面)与待生成(侧面/全身)交错时 slots 仍与 shots 顺序对齐', () => {
+    const prevRefs = [
+      { angle: '正面', url: '/uploads/a/1-正面.png', alive: true },
+      { angle: '背面', url: '/uploads/a/3-背面.png', alive: true },
+    ];
+    const { slots, pending } = planPortraitGeneration(shots, prevRefs, false, 1700000000000);
+    expect(slots.map((s) => s?.angle ?? null)).toEqual(['正面', null, '背面', null]);
+    expect(slots[0].url).toBe('/uploads/a/1-正面.png');
+    expect(pending.map((p) => p.idx)).toEqual([1, 3]);
+    expect(pending[0].sh.angle).toBe('侧面');
+    expect(pending[1].sh.angle).toBe('全身姿势');
+    // 待生成槽位拿到的 tag 必须是**该下标自己**的角度(而不是复用交错后的错位角度)
+    expect(pending[0].tag).toBe(portraitFileTag(1, '侧面', false));
+    expect(pending[1].tag).toBe(portraitFileTag(3, '全身姿势', false));
+  });
+
+  it('复用的槽位带 angle 且 canonical 置 false(canonical 由上层统一回填)', () => {
+    const prevRefs = [{ angle: '侧面', url: '/u/2.png', alive: true }];
+    const { slots } = planPortraitGeneration(shots, prevRefs, false, 1);
+    expect(slots[1].angle).toBe('侧面');
+    expect(slots[1].canonical).toBe(false);
+    expect(slots[0]).toBeNull();
+  });
+
+  it('force 时全部待生成,prev 仍带回供失败兜底', () => {
+    const prevRefs = [{ angle: '正面', url: '/u/1.png', alive: true }];
+    const { slots, pending } = planPortraitGeneration(shots, prevRefs, true, 1700000000000);
+    expect(slots.every((s) => s === null)).toBe(true);
+    expect(pending).toHaveLength(4);
+    expect(pending[0].prev?.url).toBe('/u/1.png');
+    expect(pending[0].tag).toMatch(/-1700000000000$/); // force 换名防缓存
+  });
+
+  it('alive=false 的旧图不复用(进 pending 补画)', () => {
+    const prevRefs = [{ angle: '正面', url: '/u/1.png', alive: false }];
+    const { slots, pending } = planPortraitGeneration(shots, prevRefs, false, 1);
+    expect(slots[0]).toBeNull();
+    expect(pending.map((p) => p.idx)).toContain(0);
   });
 });
 
@@ -121,10 +206,12 @@ describe('portraitFileTag 换名规则(防缓存假生效)', () => {
   });
 });
 
-describe('buildScenePrompt / buildPropPrompt 拼接风格锚', () => {
+describe('buildScenePrompt / buildPropPrompt / buildWardrobePrompt / buildVehiclePrompt 拼接风格锚', () => {
   it('风格词总在末尾,便于全剧统一强拼接', () => {
     expect(buildScenePrompt('机房', '水墨国风').endsWith('水墨国风')).toBe(true);
     expect(buildPropPrompt('钥匙', '水墨国风').endsWith('水墨国风')).toBe(true);
+    expect(buildWardrobePrompt('米白衬衫', '水墨国风').endsWith('水墨国风')).toBe(true);
+    expect(buildVehiclePrompt('渔船', '水墨国风').endsWith('水墨国风')).toBe(true);
   });
 });
 

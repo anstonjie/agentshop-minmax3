@@ -6,8 +6,8 @@
 // degraded 跳过后续;但"个别镜头 degraded"会直接进成片,变成换脸镜头。
 // P2-b:在关键帧步骤内,对 degraded 的镜头**先尝试补参考图重生一次**,补不上再放行。
 //
-// ⚠️ 重生要额外图像生成额度,故 flag 默认关:DRAMA_KEYFRAME_RETRY_DEGRADED=1 才启用。
-// 本模块只做纯决策:哪些 degraded 镜头该重生、重生几次。
+// ⚠️ 重生要额外图像生成额度,故 flag **默认关**:DRAMA_KEYFRAME_RETRY_DEGRADED=1 才启用。
+// 本模块只做纯决策:哪些 degraded 镜头该重生、重生几次。质量优先的实测/演示可临时开。
 // ============================================================================
 
 export interface KeyframePlanLike {

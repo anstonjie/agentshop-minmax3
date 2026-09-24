@@ -75,6 +75,68 @@ export function composeGateEnabled(env: NodeJS.ProcessEnv = process.env): boolea
   return String(env.DRAMA_COMPOSE_GATE || '').trim() !== '0';
 }
 
+/** 缺镜点名条目:哪个镜、什么状态、一句话原因(供时间线/前端一键补做) */
+export interface FailedShotDetail {
+  shot_idx: number;
+  status: string;
+  reason: string;
+}
+
+/** 短因最大长度(时间线一行能放下;超长截断加 …) */
+export const FAILED_SHOT_REASON_MAX = 120;
+
+/**
+ * 从 step4 产出里点出缺镜(无 video_url 的全部:failed/skipped/pending)。
+ * 2026-09-24:e2e 实测 11 号镜 4 次 503 出局,step5 只报 missing_shots:1,
+ *   batch 日志"成片缺几个" —— 哪一镜、为什么,全靠猜。点名进产出 + 时间线。
+ * 纯函数;reason 取 error/reason 压成一行短因,无号条目跳过(补做按镜号打靶)。
+ */
+export function failedShotDetails(shots: any): FailedShotDetail[] {
+  if (!Array.isArray(shots)) return [];
+  const out: FailedShotDetail[] = [];
+  for (const s of shots) {
+    if (!s || typeof s !== 'object') continue;
+    if (s.video_url) continue;
+    const idx = Number(s.shot_idx);
+    if (!Number.isFinite(idx)) continue;
+    const raw = String(s.error ?? s.reason ?? s.status ?? 'unknown');
+    const oneLine = raw.replace(/\s+/g, ' ').trim() || 'unknown';
+    const reason = oneLine.length > FAILED_SHOT_REASON_MAX
+      ? oneLine.slice(0, FAILED_SHOT_REASON_MAX - 1) + '…'
+      : oneLine;
+    out.push({ shot_idx: idx, status: String(s.status || 'unknown'), reason });
+  }
+  return out.sort((a, b) => a.shot_idx - b.shot_idx);
+}
+
+/** 把缺镜清单压成时间线一句话;空清单返回 ''(调用方不拼)。 */
+export function summarizeFailedShots(details: FailedShotDetail[]): string {
+  if (!Array.isArray(details) || !details.length) return '';
+  return '缺镜 ' + details
+    .map((d) => `#${d.shot_idx}(${d.status}${d.reason ? `:${d.reason}` : ''})`)
+    .join('、');
+}
+
+/**
+ * 硬冻自动回炉规划(纯函数)。
+ * 只回炉 frozen(硬冻,freezedetect 保守地板,误报少);static(近静止)仅提示 ——
+ *   意图性的慢镜(breath/close 拉远)YDIF 天然低,自动回炉会烧额度且越烧越"动",
+ *   违背导演意图。回炉换 seed(见 genStep6),同 seed 重烧大概率复现同一冻镜。
+ * @param auditShots step5 产出的 audit_shots({static/frozen: 镜号数组})
+ * @param alreadyRemade 本轮(本集)是否已回炉过 —— 每集最多自动回炉一次,防反复烧
+ */
+export function planFrozenRemake(
+  auditShots: { static?: unknown; frozen?: unknown } | null | undefined,
+  alreadyRemade: unknown,
+): number[] {
+  if (alreadyRemade) return [];
+  const frozen = Array.isArray(auditShots?.frozen) ? auditShots.frozen : [];
+  const uniq = [...new Set(
+    frozen.map(Number).filter((n) => Number.isFinite(n)),
+  )].sort((a, b) => a - b);
+  return uniq;
+}
+
 /** 编排器最多自动补做几轮(回 step4 补失败镜 + 重合成)。DRAMA_COMPOSE_GATE_ROUNDS 覆盖,默认 2 */
 export function composeGateMaxRounds(env: NodeJS.ProcessEnv = process.env): number {
   const n = Number(env.DRAMA_COMPOSE_GATE_ROUNDS);

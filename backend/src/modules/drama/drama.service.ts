@@ -26,12 +26,12 @@ import {
   matchAssets, summarize, applyDecision, suggestSlug, normalizeName,
   type AssetNeed, type AssetRecord, type MatchResult, type PrecheckReport,
 } from './asset-matcher';
-import { planAssetShots, portraitFileTag } from './concept-art';
+import { planAssetShots, portraitFileTag, planPortraitGeneration } from './concept-art';
 import {
   buildKeyframePlan, type KeyframeShot, type RefAsset,
 } from './keyframe-plan';
 import {
-  buildEpisodeOutlinePrompt, normalizeEpisodeOutline, outlineQuoteStats,
+  buildEpisodeOutlinePrompt, normalizeEpisodeOutline, outlineQuoteStats, sceneAssetSlugs,
 } from './episode-outline-prompt';
 import { buildEpisodeAnchor, type LedgerChapterLike, type BeatAnchorLike } from './novel-anchor';
 import { applyTextEdits } from './timeline';
@@ -40,6 +40,7 @@ import {
 } from './visual-qc';
 import { planDegradedRetry } from './degraded-retry';
 import { resolveEpisodeTargetSec } from './episode-budget';
+import { normalizeBatchPolicy } from './drama-pricing';
 import { dramaNovelDir } from '../../common/paths';
 
 const DEFAULT_AGENT_ID = 201;
@@ -907,6 +908,7 @@ export class DramaService {
         '只输出 JSON,无 markdown:{"characters":[{"name":"","descVisual":"","descPersona":""}],' +
         '"locations":[{"name":"","descVisual":""}],"props":[{"name":"","descVisual":""}],' +
         '"vehicles":[{"name":"","descVisual":""}],"wardrobe":[{"name":"","descVisual":""}]}。' +
+        'wardrobe 的 descVisual 只写衣服本身(版型/颜色/面料/细节),禁止写谁在穿、禁止出现人物外貌。' +
         '某类没有提及就输出空数组。',
         `材料:\n${material.slice(0, 12000)}`,
         0.3, 4096,
@@ -1008,34 +1010,23 @@ export class DramaService {
     );
     const ctx = { userId: Number(drama.userId), agentId: Number(drama.agentId) };
     const prevRefs = this.parseJson(asset.refs, []) as any[];
-    const refs: any[] = [];
-    let okCount = 0; let reused = 0;
+
+    // 2026-09-23 批5:按位回填 —— 旧实现"复用 push 进 refs / 待生成 genResults 再 push"
+    // 在交错时顺序错位,QC/文件名会用错角度提示词。planPortraitGeneration 保证
+    // slots 与 shots 逐位对齐。
+    const { slots, pending } = planPortraitGeneration(shots, prevRefs, force);
+    let okCount = 0;
+    let reused = 0;
+    for (const s of slots) {
+      if (s && s.alive !== false) okCount++;
+      if (s && !pending.some((p) => p.sh?.angle === s.angle)) reused++;
+    }
 
     // 2026-08-28:增量定妆。上游会返回 503「text image queue is full」,
     //   一把全重跑等于把已经成功的几张再烧一遍配额(与 step6 增量重生成同一道理)。
     //   默认只补缺口/失败的角度;force=true 才整套重画。
-    // 2026-09-14:并行化 + 多 key 轮询 —— 之前串行 for 循环逐角度走 dispatcher
-    //   单 key 通道(callImage),4 视图 40-120s/资产;现在与 ep-step3 关键帧同构:
-    //   Promise.all 并行 + callImageWithKey 多 key 轮询(nextKey),约 ~3-6 倍提速。
-    //   计费口径不变:drama-pricing.ts 已注明 callImage/callImageWithKey 均不触发
-    //   credits 结算链,切通道对钱包零影响;seed 锁定/增量复用/canonical 逻辑原样保留。
-    const pending: { idx: number; sh: any; tag: string; prev: any }[] = [];
-    for (let i = 0; i < shots.length; i++) {
-      const sh = shots[i];
-      // 命名规则在 concept-art.portraitFileTag(纯函数,已单测):
-      // force 重画必须换文件名,否则 URL 不变会让前端继续显示旧缓存图。
-      const tag = portraitFileTag(i, sh.angle, force);
-      const prev = prevRefs.find((r) => String(r.angle) === sh.angle);
-      const prevUsable = prev && prev.url && prev.alive !== false;
-      if (!force && prevUsable) {
-        refs.push({ ...prev, angle: sh.angle, canonical: false });
-        okCount++; reused++;
-        continue;
-      }
-      pending.push({ idx: i, sh, tag, prev: prev || null });
-    }
-    // 并行画所有待生成角度,每张轮询取 key(单张失败只丢这一张,不整单失败)
-    const genResults = await Promise.all(pending.map(({ sh, tag, prev }) => {
+    // 2026-09-14:并行化 + 多 key 轮询 —— 与 ep-step3 关键帧同构。
+    const genResults = await Promise.all(pending.map(({ idx, sh, tag, prev }) => {
       const apiKey = this.montage.nextKey();
       const seed = angleSeed(sh.angle);
       return (async () => {
@@ -1046,6 +1037,7 @@ export class DramaService {
           );
           const local = await this.landRef(remote, asset.uuid, tag);
           return {
+            idx,
             ok: true,
             ref: {
               angle: sh.angle, url: local, remoteUrl: remote,
@@ -1055,6 +1047,7 @@ export class DramaService {
           };
         } catch (e: any) {
           return {
+            idx,
             ok: false,
             ref: {
               angle: sh.angle, url: prev?.url || null, remoteUrl: prev?.remoteUrl || null,
@@ -1065,19 +1058,22 @@ export class DramaService {
         }
       })();
     }));
-    // 按原角度顺序回填(pending 与 refs 的顺序对齐:push 时保持 shots 顺序)
+    // 按 idx 写回 slots(与 shots 严格同位)
     for (const r of genResults) {
-      refs.push(r.ref);
+      slots[r.idx] = r.ref;
       if (r.ok && r.ref.alive) {
         okCount++;
         this.logger.log(`[portrait] ${asset.name} ${r.ref.angle} OK`);
       } else if (r.ok) {
-        // 生成成功但落地失败:保留 remoteUrl 给前端,okCount 不计(与旧逻辑一致)
         this.logger.warn(`[portrait] ${asset.name} ${r.ref.angle} 生成成功但落地失败`);
       } else {
         this.logger.warn(`[portrait] ${asset.name} ${r.ref.angle} 失败: ${r.ref.error}`);
       }
     }
+    const refs: any[] = slots.map((s, i) => s || {
+      angle: shots[i]?.angle || `视图${i + 1}`, alive: false,
+      error: '未生成',
+    });
 
     // 2026-09-16(批4)**视觉质检门**:对第一张可用视图查解剖硬伤(多条胳膊/手指
     //   畸形/多头/部件错位)—— 之前 alive=!!local 只判"下载落地",坏图照判 ok 入库,
@@ -1086,21 +1082,28 @@ export class DramaService {
     //   前端资产卡露出 + 一键重生成。多模态通道不可用 = 降级不拦,绝不打死定妆链。
     //   复用旧图(force=false 命中缓存)也会重检 —— 存量坏图下次跑批即被标出。
     if (String(process.env.DRAMA_VISUAL_QC || '1').trim() !== '0') {
-      const qcIdx = refs.findIndex((r) => r.alive !== false && (r.url || r.remoteUrl));
-      const qcRemote = qcIdx >= 0 ? String(refs[qcIdx].remoteUrl || '') : '';
-      if (qcIdx >= 0 && /^https?:\/\//i.test(qcRemote)) {
+      // 2026-09-23 批5:逐张可用视图都检,且带 angle —— 只检第 1 张不带角度时,
+      // "背面画成正面"结构性检不出来(正面看起来毫无硬伤)。通道不可用时第一张
+      // 打降级戳后不再空检其余(避免每张都超时)。
+      let channelDown = false;
+      for (let qi = 0; qi < refs.length && !channelDown; qi++) {
+        const r = refs[qi];
+        if (!r || r.alive === false) continue;
+        const qcRemote = String(r.remoteUrl || '');
+        if (!/^https?:\/\//i.test(qcRemote)) continue;
+        const angle = String(r.angle || shots[qi]?.angle || '');
         let verdict = parseVisualQcVerdict(
           await this.montage.callVisionLlm(
-            ctx, VISUAL_QC_SYS, qcRemote, buildVisualQcQuestion(asset.name, asset.kind),
+            ctx, VISUAL_QC_SYS, qcRemote, buildVisualQcQuestion(asset.name, asset.kind, angle),
           ),
         );
         let attempts = 0;
         while (verdict && !verdict.ok && attempts < VISUAL_QC_MAX_REDRAW) {
           attempts++;
           this.logger.warn(
-            `[portrait] ${asset.name} 质检不合格(${verdict.issues.join(';')}) → 自动重画 ${attempts}/${VISUAL_QC_MAX_REDRAW}`,
+            `[portrait] ${asset.name} ${angle} 质检不合格(${verdict.issues.join(';')}) → 自动重画 ${attempts}/${VISUAL_QC_MAX_REDRAW}`,
           );
-          const sh = shots[qcIdx];
+          const sh = shots[qi];
           try {
             const apiKey = this.montage.nextKey();
             // 随机种子(不传 seed)+ force 式新文件名,否则同 seed 同 prompt 必出同一张坏图
@@ -1108,25 +1111,25 @@ export class DramaService {
               apiKey, sh.prompt, sh.size, sh.negative || undefined,
               undefined, undefined, undefined,
             );
-            const local = await this.landRef(remote, asset.uuid, portraitFileTag(qcIdx, sh.angle, true));
+            const local = await this.landRef(remote, asset.uuid, portraitFileTag(qi, sh.angle, true));
             if (!local) break;
-            refs[qcIdx] = {
-              ...refs[qcIdx], url: local, remoteUrl: remote,
+            refs[qi] = {
+              ...refs[qi], url: local, remoteUrl: remote,
               alive: true, landedAt: new Date().toISOString(),
             };
             verdict = parseVisualQcVerdict(
               await this.montage.callVisionLlm(
-                ctx, VISUAL_QC_SYS, remote, buildVisualQcQuestion(asset.name, asset.kind),
+                ctx, VISUAL_QC_SYS, remote, buildVisualQcQuestion(asset.name, asset.kind, angle),
               ),
             );
           } catch (e: any) {
-            this.logger.warn(`[portrait] ${asset.name} 质检重画失败(保留原图): ${e?.message}`);
+            this.logger.warn(`[portrait] ${asset.name} ${angle} 质检重画失败(保留原图): ${e?.message}`);
             break;
           }
         }
         if (verdict) {
-          refs[qcIdx] = {
-            ...refs[qcIdx],
+          refs[qi] = {
+            ...refs[qi],
             qc: {
               ok: verdict.ok, issues: verdict.issues, attempts,
               at: new Date().toISOString(),
@@ -1134,14 +1137,14 @@ export class DramaService {
           };
           if (!verdict.ok) {
             this.logger.warn(
-              `[portrait] ${asset.name} 重画 ${attempts} 次仍不合格,标 suspect:${verdict.issues.join(';')}`,
+              `[portrait] ${asset.name} ${angle} 重画 ${attempts} 次仍不合格,标 suspect:${verdict.issues.join(';')}`,
             );
           }
         } else {
-          // 通道不可用(模型不支持视觉/超时):打降级戳,跑批不再重复空检该资产;
-          //   与 qc 判定区分开 —— 降级不是"合格",前端不显示合格徽章
-          refs[qcIdx] = {
-            ...refs[qcIdx],
+          // 通道不可用(模型不支持视觉/超时):打降级戳,本资产其余视图不再空检
+          channelDown = true;
+          refs[qi] = {
+            ...refs[qi],
             qcSkipped: 'channel_unavailable',
             qcSkippedAt: new Date().toISOString(),
           };
@@ -1282,6 +1285,11 @@ export class DramaService {
         .map((a) => ({ id: a.slug, name: a.name, description: a.descVisual })),
       props: list.filter((a) => a.kind === 'prop')
         .map((a) => ({ id: a.slug, name: a.name, description: a.descVisual })),
+      // 2026-09-24:载具/服装美术层已有,设计形状层之前漏掉 → 分镜永远引用不到
+      vehicles: list.filter((a) => a.kind === 'vehicle')
+        .map((a) => ({ id: a.slug, name: a.name, description: a.descVisual })),
+      wardrobe: list.filter((a) => a.kind === 'wardrobe')
+        .map((a) => ({ id: a.slug, name: a.name, description: a.descVisual })),
     };
   }
 
@@ -1320,22 +1328,20 @@ export class DramaService {
     for (const n of declared) {
       if (!n?.kind || !n?.name) continue;
       seen.add(String(n.slug || n.name));
+      const slug = String(n.slug || n.name);
       needs.push({
         kind: n.kind, name: n.name, slugHint: n.slug,
         descVisual: n.descVisual, descPersona: n.descPersona,
         variantHint: n.variantHint,
+        // 2026-09-24:appearsIn 走 sceneAssetSlugs —— 场景里的 vehicles/wardrobe 也算出场
         appearsIn: (outline?.scenes || [])
-          .filter((sc: any) => (sc.characters || []).includes(n.slug) || (sc.props || []).includes(n.slug))
+          .filter((sc: any) => sceneAssetSlugs(sc).includes(slug))
           .map((sc: any) => sc.idx),
       });
     }
 
     for (const sc of outline?.scenes || []) {
-      const refs = [
-        ...(sc.characters || []), ...(sc.props || []),
-        ...(sc.location_id ? [sc.location_id] : []),
-        ...(sc.location ? [sc.location] : []),
-      ];
+      const refs = sceneAssetSlugs(sc);
       for (const slug of refs) {
         const key = String(slug || '');
         if (!key || seen.has(key)) continue;
@@ -1555,19 +1561,25 @@ export class DramaService {
           );
         }
         let { outline, warnings } = normalizeEpisodeOutline(parsed);
-        // 2026-09-16(批2)**quote 忠实门**:有原文锚点却整份大纲 0 场逐字引用 →
-        //   带修订要求重生成一次;仍不过 → 标 quoteMissing 进 warnings(批3 露出),不静默放过。
-        //   诊断断点⑥:原文 quote 走到大纲提示词就蒸发,分镜/字幕自此凭 ≤50 字摘要重编。
+        // 2026-09-16(批2)**quote 忠实门**;2026-09-23 改比例阈值 + 摘录计入:
+        //   · 旧门只在「有 beatsAnchor 且 withQuotes===0」触发 —— 有摘录无锚点、
+        //     或只有 1/5 场引用时整份过门,分镜仍凭 ≤50 字摘要重编(叙事有损);
+        //   · 现在:有任何原文输入(beatsAnchor ∪ chapterExcerpt)就查,
+        //     withQuotes/scenes < 0.5 视为引用不足 → 重生成一次;仍不足标 quoteMissing,
+        //     并在 step2 **硬拦**(见 case 2),禁止无逐字锚点的分镜直接进生产。
         let qstats = outlineQuoteStats(outline);
         let quoteMissing = false;
-        if (anchor.beatsAnchor && qstats.scenes > 0 && qstats.withQuotes === 0) {
+        const hasAnchor = !!(anchor.beatsAnchor || anchor.chapterExcerpt);
+        const quoteRatioOk = qstats.scenes > 0 && qstats.withQuotes / qstats.scenes >= 0.5;
+        if (hasAnchor && qstats.scenes > 0 && !quoteRatioOk) {
           this.logger.warn(
-            `[ep-step0] quote 门未过:0/${qstats.scenes} 场引用逐字锚点 → 重生成一次`,
+            `[ep-step0] quote 门未过:${qstats.withQuotes}/${qstats.scenes} 场引用逐字锚点(<50%) → 重生成一次`,
           );
           const retryRaw = await this.montage.callLlm(
             ctx,
-            `${prompt.system}\n\n[修订要求] 上一版输出里没有任何 scene 提供 quotes(本场改编自的原文逐字句)。` +
-            `重新输出整集大纲:每个 scene 的 quotes 必须从锚点「」内或摘录原文里原样抄录 1-3 句;纯衔接场才可空数组。`,
+            `${prompt.system}\n\n[修订要求] 上一版输出里 scene 逐字引用不足(${qstats.withQuotes}/${qstats.scenes})。` +
+            `重新输出整集大纲:至少半数(建议全部非衔接场)scene 的 quotes 必须从锚点「」内或摘录原文里原样抄录 1-3 句;` +
+            `纯衔接场才可空数组。禁止发明锚点/摘录没有的新主线。`,
             prompt.user, prompt.temperature, prompt.maxTokens,
           );
           const retryParsed = this.montage.parseJsonSafe(retryRaw);
@@ -1578,9 +1590,12 @@ export class DramaService {
             qstats = outlineQuoteStats(outline);
           }
         }
-        if (anchor.beatsAnchor && qstats.scenes > 0 && qstats.withQuotes === 0) {
+        if (hasAnchor && qstats.scenes > 0 && !(qstats.scenes > 0 && qstats.withQuotes / qstats.scenes >= 0.5)) {
           quoteMissing = true;
-          warnings.push('quote 门:重生成后仍无 scene 引用原文逐字句,分镜将退化为摘要改编(已标 quoteMissing)');
+          warnings.push(
+            `quote 门:重生成后引用率仍不足(${qstats.withQuotes}/${qstats.scenes}),` +
+            `分镜将被硬拦直到大纲补足原文逐字句(已标 quoteMissing)`,
+          );
         }
         // 2026-09-16(批3 透明工作台):把「本集从哪来」一并落库 —— 原文锚点与
         //   完整提示词。之前这两样进 prompt 即丢,用户无法核对"编剧看着什么写"。
@@ -1657,6 +1672,13 @@ export class DramaService {
       case 2: {
         const outline = sd['0']?.output;
         if (!outline) throw new BadRequestException('请先生成本集大纲(第 0 步)');
+        // 2026-09-23 叙事硬门:大纲没过 quote 门 → 禁止分镜。
+        // 旧路径 quoteMissing 只进 warnings 继续跑,分镜凭摘要重编 = 与小说脱节。
+        if (outline.quoteMissing) {
+          throw new BadRequestException(
+            '本集大纲 quote 门未过(原文逐字引用不足)—— 请先重跑第 0 步大纲,补足 scene.quotes 后再分镜,否则视频将与小说剧情脱节',
+          );
+        }
         const design = await this.designFromLibrary(drama.id);
         if (!design.characters.length) {
           throw new BadRequestException(
@@ -1665,7 +1687,8 @@ export class DramaService {
         }
         const unresolved = (outline.needs_assets || [])
           .map((n: any) => n.slug)
-          .filter((slug: string) => !design.characters.concat(design.locations, design.props)
+          .filter((slug: string) => !design.characters
+            .concat(design.locations, design.props, design.vehicles || [], design.wardrobe || [])
             .some((x: any) => x.id === slug));
         const shots = await this.montage.genStep4Shots(
           { ...input, style: styleSpec.stylePrompt, targetSec },
@@ -1719,21 +1742,35 @@ export class DramaService {
                 shot_idx: plan.shotIdx, url, prompt: plan.prompt,
                 ref_urls: plan.refUrls, ref_sources: plan.refSources,
                 degraded: plan.degraded,
+                unanchored_characters: plan.unanchoredCharacters,
               };
             } catch (e: any) {
-              const fallbackUrl = (plan.refUrls || []).find((u: string) => typeof u === 'string' && /^https?:\/\//i.test(u));
+              // 2026-09-23 身份:兜底首帧只允许 character 参考图 —— 场景/道具图当
+              // 首帧会把房间画成人脸锚,跨镜变人/变性别。无 character ref 则干净失败。
+              const charSrc = (plan.refSources || []).find(
+                (s: any) => s?.kind === 'character' && s?.sent
+                  && typeof s?.url === 'string' && /^https?:\/\//i.test(s.url),
+              );
+              const fallbackUrl = charSrc?.url || null;
               if (fallbackUrl) {
-                this.logger.warn(`[ep-step3] 镜 #${plan.shotIdx} 出图失败(${e?.message}), 自动使用定妆图兜底关键帧首帧`);
+                this.logger.warn(`[ep-step3] 镜 #${plan.shotIdx} 出图失败(${e?.message}), 自动使用角色定妆图兜底关键帧首帧`);
                 return {
                   shot_idx: plan.shotIdx, url: fallbackUrl, prompt: plan.prompt,
                   ref_urls: plan.refUrls, ref_sources: plan.refSources,
                   degraded: plan.degraded, fallback_to_ref: true,
+                  unanchored_characters: plan.unanchoredCharacters,
                 };
+              }
+              if ((plan.refUrls || []).length) {
+                this.logger.warn(
+                  `[ep-step3] 镜 #${plan.shotIdx} 出图失败且无 character 参考图可兜底(拒绝场景图当身份锚):${e?.message}`,
+                );
               }
               return {
                 shot_idx: plan.shotIdx, url: null, prompt: plan.prompt,
                 ref_urls: plan.refUrls, ref_sources: plan.refSources,
                 degraded: plan.degraded, error: e?.message || String(e),
+                unanchored_characters: plan.unanchoredCharacters,
               };
             }
           })();
@@ -1765,6 +1802,8 @@ export class DramaService {
           keyframes,
           ref_backed: keyframes.filter((k: any) => (k.ref_urls || []).length > 0).length,
           degraded_count: keyframes.filter((k: any) => k.degraded === true).length,
+          unanchored_count: keyframes.filter((k: any) =>
+            Array.isArray(k.unanchored_characters) && k.unanchored_characters.length > 0).length,
           missing_refs: missing,
           degraded_retry: degradedRetry,
         });
@@ -1896,6 +1935,8 @@ export class DramaService {
       characters: slugs.filter((x) => bySlug[x]?.kind === 'character'),
       location_id: slugs.find((x) => bySlug[x]?.kind === 'location'),
       props: slugs.filter((x) => bySlug[x]?.kind === 'prop'),
+      vehicles: slugs.filter((x) => bySlug[x]?.kind === 'vehicle'),
+      wardrobe: slugs.filter((x) => bySlug[x]?.kind === 'wardrobe'),
     };
     const plan = buildKeyframePlan(shot, bySlug, styleSpec);
 
@@ -1960,9 +2001,11 @@ export class DramaService {
     if (!Number.isFinite(fromEp) || !Number.isFinite(toEp) || fromEp < 1 || toEp < fromEp) {
       throw new BadRequestException('集范围不合法(需 1 ≤ fromEp ≤ toEp)');
     }
-    const policy = input.policy || {};
-    if (!Number.isFinite(Number(policy.budgetCredits))) {
-      throw new BadRequestException('必须显式给出积分预算 budgetCredits —— 连集不允许无上限烧分');
+    let policy: Record<string, any>;
+    try {
+      policy = normalizeBatchPolicy(input.policy || {});
+    } catch (e: any) {
+      throw new BadRequestException(e?.message || String(e));
     }
     const uuid = randomUUID();
     await this.prisma.$executeRawUnsafe(
@@ -1971,13 +2014,7 @@ export class DramaService {
          \`log\`,\`createdAt\`,\`updatedAt\`)
        VALUES (?,?,?,?,?,?, 'queued', ?, 0, CAST(? AS JSON), CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3))`,
       uuid, drama.id, userId, fromEp, toEp,
-      JSON.stringify({
-        autoAssetConfirm: policy.autoAssetConfirm !== false,
-        autoVisual: policy.autoVisual !== false,
-        stopOnFailure: policy.stopOnFailure === true,
-        candidatesPerShot: Number(policy.candidatesPerShot) || 2,
-        budgetCredits: Number(policy.budgetCredits),
-      }),
+      JSON.stringify(policy),
       fromEp, JSON.stringify([]),
     );
     this.logger.log(`[batch] queued ${uuid} drama=${drama.uuid} EP${fromEp}-EP${toEp} budget=${policy.budgetCredits}`);

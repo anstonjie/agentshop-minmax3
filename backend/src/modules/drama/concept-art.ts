@@ -53,11 +53,13 @@ export const ANGLE_CONFIGS: AngleConfig[] = [
   },
 ];
 
-/** 各类定妆图的画幅 —— 角色竖幅全身,场景横幅,道具方图 */
+/** 各类定妆图的画幅 —— 角色竖幅全身,场景/载具横幅,道具/服装方图 */
 export const CONCEPT_SIZES = {
   character: '864x1152',
   location: '1280x720',
   prop: '1024x1024',
+  wardrobe: '1024x1024',
+  vehicle: '1280x720',
 } as const;
 
 /** 单个角色四视图提示词(角度关键词前置,绕开角色描述带来的脸部先验) */
@@ -76,12 +78,67 @@ ${style},
 highly detailed, professional concept art, sharp focus, single subject centered in frame`;
 }
 
+/**
+ * 场景定妆负向词(2026-09-23 批5)。
+ * 根因:场景参考图带路人会经图生图原样带进关键帧(资产参考图是身份/环境的
+ * 锚,路人会被模型当成"这个场景就该有人"),空景约束必须正负两侧同时钉。
+ */
+export const LOCATION_NEGATIVE =
+  'people, person, human, crowd, pedestrians, figures in the scene, characters, silhouettes of people, anyone';
+
 export function buildScenePrompt(locDesc: string, style: string): string {
-  return `${locDesc}, scene concept art, environment design, wide establishing shot, ${style}`;
+  return `${locDesc}, empty scene, no people, no pedestrians, no characters in frame,
+scene concept art, environment design, wide establishing shot, ${style}`;
 }
 
+/**
+ * 道具定妆负向词(2026-09-23 批5)。
+ * 根因:"product shot" 语料常带手持/人手特写,道具卡里冒出半只手/一个人。
+ */
+export const PROP_NEGATIVE =
+  'person, people, human, hands holding the object, hand, fingers, face, head, model, anyone';
+
 export function buildPropPrompt(propDesc: string, style: string): string {
-  return `${propDesc}, prop design, object concept art, centered on white background, product shot, ${style}`;
+  return `${propDesc}, prop design, object concept art, isolated object on white background,
+centered on white background, clean background,
+product shot, not held by any hands, no people, no hands in frame, ${style}`;
+}
+
+/**
+ * 载具定妆提示词(2026-09-23 批5)。
+ * 根因:载具之前落道具兜底 —— 方图 + "prop design" 语料,且不带任何
+ * 人物排除词,画出来常带司机/乘客(载具参考图再把这些人在关键帧里锚回去)。
+ */
+export const VEHICLE_NEGATIVE =
+  'driver, passenger, people, person, human, face, hands on the wheel, pedestrians, crowd, anyone inside or around the vehicle';
+
+export function buildVehiclePrompt(vehicleDesc: string, style: string): string {
+  return `${vehicleDesc}, vehicle design sheet, isolated vehicle on white background,
+no driver, no passengers, no people inside or around the vehicle, empty vehicle,
+side three-quarter view, transport concept art, product shot of the vehicle alone,
+clean background, highly detailed, professional concept art, sharp focus,
+single subject centered in frame, ${style}`;
+}
+
+/**
+ * 服装定妆提示词(2026-09-23)。
+ * 根因:服装 kind 之前落到道具兜底 buildPropPrompt —— "product shot" 语料里
+ * 服装品类几乎全是模特上身图,加上 descVisual 常写"某某穿的衬衫",
+ * 于是资产库服装卡里出现人的头像(应只有衣服本身)。
+ * 语义:平铺或隐形模特(ghost mannequin)空心衣形,明确排除人物/人脸/穿着者;
+ * 负向词同步列具体排除项(与角色四视图同一纪律:抽象负向词压不住脸部先验)。
+ */
+export const WARDROBE_NEGATIVE =
+  'person, people, human, model wearing clothes, man, woman, face, head, hair, hands, arms, legs, body, portrait, character, anyone wearing the garment';
+
+export function buildWardrobePrompt(wardrobeDesc: string, style: string): string {
+  return `clothing only, garment without any person, ${wardrobeDesc},
+wardrobe concept art, clothing design sheet, product shot of the garment alone,
+laid flat or on invisible ghost mannequin (empty garment, no visible person),
+no human, no model, no face, no head, no hands, not worn by anyone,
+centered on white background, clean background,
+highly detailed, professional concept art, sharp focus, single subject centered in frame,
+${style}`;
 }
 
 /** 一张待生成定妆图的完整计划 */
@@ -150,17 +207,74 @@ export function planAssetShots(
     return [{
       angle: '全景',
       prompt: buildScenePrompt(desc, style),
-      negative: '',
+      negative: LOCATION_NEGATIVE,
       size: CONCEPT_SIZES.location,
+    }];
+  }
+  // 2026-09-23:服装必须走专用提示词 —— 落道具兜底会画出"模特上身图"(见 buildWardrobePrompt 注释)
+  if (kind === 'wardrobe') {
+    const desc = item.description || item.appearance || item.name || '';
+    return [{
+      angle: '主视图',
+      prompt: buildWardrobePrompt(desc, style),
+      negative: WARDROBE_NEGATIVE,
+      size: CONCEPT_SIZES.wardrobe,
+    }];
+  }
+  // 2026-09-23 批5:载具走专用横幅提示词(在道具兜底之前),禁驾驶员/乘客
+  if (kind === 'vehicle') {
+    const desc = item.description || item.appearance || item.name || '';
+    return [{
+      angle: '主视图',
+      prompt: buildVehiclePrompt(desc, style),
+      negative: VEHICLE_NEGATIVE,
+      size: CONCEPT_SIZES.vehicle,
     }];
   }
   const desc = item.description || item.name || '';
   return [{
     angle: '主视图',
     prompt: buildPropPrompt(desc, style),
-    negative: '',
+    negative: PROP_NEGATIVE,
     size: CONCEPT_SIZES.prop,
   }];
+}
+
+/**
+ * 定妆 refs 的**按位回填计划**(2026-09-23 批5)。
+ *
+ * 根因:旧实现在一个循环里先 push 复用的旧图、再在另一个循环里 push 并行
+ * 生成的新图 —— 复用与待生成交错时 refs 顺序 ≠ shots 顺序。下游 QC 用
+ * shots[qcIdx] 取提示词、portraitFileTag(qcIdx, ...) 取文件名,索引一错位,
+ * 质检重画就用错提示词/覆盖错文件(纯函数化以便单测钉住顺序不变量)。
+ *
+ * 返回:slots 与 shots 逐位对齐(复用位填 ref,待生成位为 null);
+ * pending 带 idx/tag/prev,生成完成后按 idx 写回 slots。
+ */
+export function planPortraitGeneration(
+  shots: Array<{ angle: string }>,
+  prevRefs: any[],
+  force: boolean,
+  now: number = Date.now(),
+): {
+  slots: Array<any | null>;
+  pending: Array<{ idx: number; sh: any; tag: string; prev: any }>;
+} {
+  const slots: Array<any | null> = shots.map(() => null);
+  const pending: Array<{ idx: number; sh: any; tag: string; prev: any }> = [];
+  const prev = Array.isArray(prevRefs) ? prevRefs : [];
+  for (let i = 0; i < shots.length; i++) {
+    const sh = shots[i];
+    const tag = portraitFileTag(i, sh.angle, force, now);
+    const hit = prev.find((r) => String(r?.angle) === sh.angle);
+    const prevUsable = hit && hit.url && hit.alive !== false;
+    if (!force && prevUsable) {
+      slots[i] = { ...hit, angle: sh.angle, canonical: false };
+    } else {
+      pending.push({ idx: i, sh, tag, prev: hit || null });
+    }
+  }
+  return { slots, pending };
 }
 
 /** 落地文件名标签:角度可能含中文/括号,统一压成安全片段 */

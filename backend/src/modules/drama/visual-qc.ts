@@ -18,16 +18,38 @@ export interface VisualQcVerdict {
 }
 
 /** 质检员人设:只挑硬伤,不评美感 —— 防止把"画得不好看"误判成废图 */
-export const VISUAL_QC_SYS = `你是严格的影视美术质检员,只检查人物/场景/道具设定图的**解剖与结构硬伤**:
+export const VISUAL_QC_SYS = `你是严格的影视美术质检员,只检查人物/场景/道具/载具/服装设定图的**解剖与结构硬伤**:
 多余或缺失的肢体(如三条胳膊)、手指畸形(多于五指/融合)、多个头、五官错位、身体部件穿模错位、物体悬空无支撑。
+角色设定图必须**恰好一名角色** —— 出现两人及以上(合影/镜像/多人合影)属于硬伤。
+场景设定图应为空景 —— 出现路人/人物属于硬伤。
+载具设定图不得有驾驶员/乘客/任何人物 —— 出现即为硬伤。
+服装设定图中出现人物(头像/脸/穿着者/模特)也属于硬伤 —— 服装图只能有衣服本身。
 **不评价**美感、风格、与描述的相似度、构图。没有硬伤就必须判 ok=true。
 只输出 JSON,无 markdown:{"ok": true|false, "issues": ["硬伤描述,≤20字/条,最多4条"]}`;
 
 /** 针对单个资产构造质检问题(带资产名与类别,让模型有参照) */
-export function buildVisualQcQuestion(assetName: string, kind: string): string {
-  const kindLabel = kind === 'character' ? '角色' : kind === 'location' ? '场景' : '道具';
+export function buildVisualQcQuestion(assetName: string, kind: string, angle?: string): string {
+  const kindLabel = kind === 'character' ? '角色'
+    : kind === 'location' ? '场景'
+      : kind === 'wardrobe' ? '服装'
+        : kind === 'vehicle' ? '载具' : '道具';
+  const extra = kind === 'wardrobe'
+    ? '这是服装设定图:画面里出现任何人物/头像/脸/穿着者即为硬伤(除非幽灵模特且完全不可见人形面孔)。'
+    : kind === 'character'
+      ? '这是角色设定图:画面必须恰好一名角色,出现两人及以上(合影/分身/多人)即为硬伤。'
+      : kind === 'location'
+        ? '这是场景设定图:画面应为空景,出现任何路人/人物即为硬伤。'
+        : kind === 'vehicle'
+          ? '这是载具设定图:不得出现驾驶员/乘客/任何人物,出现即为硬伤。'
+          : '';
+  // 2026-09-23 批5:质检必须带角度 —— 只检第一张且不带角度时,"背面画成正面"
+  // 结构上检不出来(正面看起来毫无硬伤)
+  const angleBit = angle
+    ? `本张是「${angle}」视图:方向/视角必须与该角度一致(如背面图出现正脸五官即为硬伤)。`
+    : '';
   return `检查这张${kindLabel}设定图「${assetName}」是否存在解剖/结构硬伤。` +
-    `角色图重点数肢体与手指数量;场景/道具图重点看物体悬空与部件错位。无硬伤输出 {"ok": true, "issues": []}。`;
+    `角色图重点数肢体与手指数量;场景/道具/载具图重点看物体悬空与部件错位。${angleBit}${extra}` +
+    `无硬伤输出 {"ok": true, "issues": []}。`;
 }
 
 /**

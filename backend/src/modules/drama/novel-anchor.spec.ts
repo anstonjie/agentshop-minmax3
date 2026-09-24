@@ -77,6 +77,23 @@ describe('formatBeatsAnchor —— beats 逐字锚点', () => {
   it('summary 与 quote 都空的行被丢弃', () => {
     expect(formatBeatsAnchor([{ summary: '', quote: '' }])).toBe('');
   });
+
+  // 2026-09-23:beat id 上锚点行首 —— 大纲 scenes[].beat_ids 引用的唯一来源
+  it('带 id 的拍点在行首输出 {id},供大纲 beat_ids 引用', () => {
+    const out = formatBeatsAnchor([
+      { id: 'ch1-b2', summary: '拔剑', quote: '寒光一闪', must_show: true },
+      { id: 'ch1-b1', summary: '犹豫', must_show: false },
+    ]);
+    expect(out).toContain('{ch1-b2}');
+    expect(out.split('\n')[0]).toMatch(/^- \{ch1-b2\} \[必拍\]/);
+    expect(out).toContain('{ch1-b1}');
+  });
+
+  it('无 id 时行首不出现空花括号(向后兼容旧数据)', () => {
+    const out = formatBeatsAnchor([{ summary: '旧拍点', must_show: false }]);
+    expect(out).toBe('- 旧拍点');
+    expect(out).not.toContain('{}');
+  });
 });
 
 describe('buildEpisodeAnchor —— beats 优先,无 beats 回落正文', () => {

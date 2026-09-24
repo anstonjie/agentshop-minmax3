@@ -17,6 +17,9 @@
 //   · 运镜/景别用英文强权重词(模型对英文运动术语响应更稳)。
 //   · 真实性底线词固定追加,压住 morphing/flicker/distortion。
 //
+// 2026-09-24(飞书《各种运镜提示词》):运镜中英词表与 rhythm 兜底收到
+//   camera-motion.ts 单一来源;本文件只保留视频 prompt 结构组装。
+//
 // 2026-09-14 增补(方法论来源:zenstory-ai/drama-skills,MIT,
 //   skills/short-drama-video-prompts/SKILL.md + docs/character-consistency-across-shots.md):
 //   · **多人物守卫**:>1 人同框时追加身份区隔护栏词。跨镜穿帮多数不是脸变了,
@@ -33,30 +36,18 @@
 // ============================================================================
 
 import { sanitizeDialogue } from './dialogue-sanitizer';
+import {
+  CAMERA_MOTION_EN,
+  cameraMotionEn as cameraMotionEnShared,
+  motionForRhythm,
+  SHOT_TYPE_EN,
+  shotTypeEn as shotTypeEnShared,
+} from './camera-motion';
 
-/** 运镜(中文)→ 英文运动语言。键与 genStep4Shots 产出的 camera_motion 对齐。 */
-const CAMERA_MOTION_EN: Record<string, string> = {
-  静止: 'static locked-off camera, no camera movement',
-  推: 'slow smooth dolly-in, camera gradually pushes toward the subject',
-  拉: 'slow smooth dolly-out, camera gradually pulls back to reveal the scene',
-  摇: 'smooth horizontal panning shot',
-  移: 'lateral tracking shot, camera glides sideways',
-  跟: 'camera follows the moving subject, keeping it framed',
-  升: 'slow crane-up / rising camera move',
-  降: 'slow crane-down / descending camera move',
-  甩: 'fast whip pan',
-  环绕: 'orbiting camera circling around the subject',
-};
+// 运镜/景别词表单一来源在 camera-motion.ts;此处 re-export 保持旧 import 路径不破。
+export { CAMERA_MOTION_EN, SHOT_TYPE_EN };
 
-/** 景别(中文)→ 英文镜头语言(帮助模型理解取景范围,非强制) */
-const SHOT_TYPE_EN: Record<string, string> = {
-  远景: 'extreme wide shot',
-  全景: 'wide establishing shot',
-  中景: 'medium shot',
-  近景: 'close-up shot',
-  特写: 'extreme close-up',
-  空镜: 'empty scenic shot, no characters',
-};
+// 景别词表见 camera-motion.ts(SHOT_TYPE_EN 单一来源),此处不再复刻。
 
 /**
  * 视频真实性底线词 —— 固定追加,压制图生视频最常见的崩坏:
@@ -77,6 +68,16 @@ const MULTI_CHARACTER_TAIL =
   'no identity blending or swapping between characters, no merged or duplicated bodies, ' +
   'correct hand and finger count for every character, held props stay stable and consistent across frames, ' +
   'natural eyelines, clear turn-taking in movement and attention';
+
+/**
+ * 单人身份尾巴 —— 镜头内恰好 1 人时追加(2026-09-23 身份硬伤)。
+ * 多人已有 MULTI_CHARACTER_TAIL;单人跨镜/镜内变性别、换人没有文字护栏,
+ * 只靠首帧参考图在兜底路径(无 ref / relay 尾帧漂移)会失守。
+ * 措辞刻意避开 "same face"(既有铁律测试禁止该字样)。
+ */
+const SINGLE_CHAR_IDENTITY_TAIL =
+  'keep the exact same person from the first frame throughout the shot; ' +
+  'do not change gender, age, or identity mid-shot';
 
 /**
  * 无字幕护栏 —— 默认追加(2026-09-14,drama-skills 要求每镜显式声明)。
@@ -105,6 +106,8 @@ export interface ShotForVideo {
    * 含糊人声,成片听不到剧本文本 → 观感"没有对话"。
    */
   dialogue?: string;
+  /** 节奏角色(hook/setup/…或中文别名);camera_motion 缺失/静止时运镜兜底用 */
+  rhythm?: string;
 }
 
 /** 台词类型:speech=角色对白 / voiceover=旁白画外音 / ambient=纯环境音(不说话) */
@@ -190,6 +193,15 @@ export interface VideoPromptOptions {
   /** 资产库角色名表 —— 供 dialogueInstruction 精确认出说话人(剥「××地说」「愤怒的××」、
    *  拆一镜多说话人)。缺省时净化器保守处理,台词仍干净,只是 speaker 可能为 null。 */
   knownNames?: string[];
+  /**
+   * 本场故事锚点(2026-09-23 叙事对齐):scene summary + 原文 quote 一句话。
+   * 之前 5-10s 视频 prompt 纯运动指令零剧情,模型不知道这段在讲什么 → 东一棒槌西一棒槌。
+   */
+  storyBeat?: string;
+  /** 上一镜 end_state(拼进因果链,让本镜从可见前情继续) */
+  prevEndState?: string;
+  /** 节奏角色(hook/setup/…或中文别名);camera_motion 缺失或静止时作运镜兜底 */
+  rhythm?: string;
 }
 
 /** 本镜出场人物数:优先 shot.characters 数组,其次 opts.characterCount */
@@ -222,6 +234,13 @@ export function buildShotVideoPrompt(
   // ① 运动主体:优先用分镜画面描述(它已禁写长相,只讲构图/动作/环境)
   const base = String(shot?.description || opts.fallback || '').trim();
   if (base) parts.push(base);
+
+  // ①′ 剧情锚点 + 前情因果(2026-09-23 叙事对齐):5-10s 片段要知道自己在讲哪一场戏、
+  //     承接上一镜的可见终点 —— 否则纯运动指令堆叠 = 画面会动但剧情看不懂。
+  const storyBeat = String(opts.storyBeat || '').trim();
+  if (storyBeat) parts.push(`story beat for this shot: ${storyBeat}`);
+  const prevEndState = String(opts.prevEndState || '').trim();
+  if (prevEndState) parts.push(`continue from previous shot ending: ${prevEndState}`);
 
   // reference 模式:显式告诉模型"以参考图/音频为准",避免它把素材当灵感自由发挥
   if (opts.referenceMode) {
@@ -261,12 +280,24 @@ export function buildShotVideoPrompt(
   if (stEn) parts.push(stEn);
 
   // ④ 运镜(运动语言的核心)
-  const cmEn = CAMERA_MOTION_EN[String(shot?.camera_motion || '').trim()];
+  //    缺失或「静止」且带 rhythm → 用 rhythm 默认运镜兜底(防死镜);
+  //    已写有效运镜时不覆盖 LLM 选择。词表见 camera-motion.ts。
+  const rawMotion = String(shot?.camera_motion || '').trim();
+  const rhythmKey = String(shot?.rhythm || opts.rhythm || '').trim();
+  let effectiveMotion = rawMotion;
+  if (!rawMotion || rawMotion === '静止') {
+    const fb = motionForRhythm(rhythmKey);
+    if (fb && CAMERA_MOTION_EN[fb]) effectiveMotion = fb;
+  }
+  const cmEn = cameraMotionEnShared(effectiveMotion);
   if (cmEn) parts.push(cmEn);
 
-  // ⑤ 多人物守卫(>1 人同框才追加)
-  if (shotCharacterCount(shot, opts) > 1) {
+  // ⑤ 多人物守卫(>1 人同框才追加);恰好 1 人 → 单人身份尾巴(镜内不许变性别/换人)
+  const charCount = shotCharacterCount(shot, opts);
+  if (charCount > 1) {
     parts.push(MULTI_CHARACTER_TAIL);
+  } else if (charCount === 1) {
+    parts.push(SINGLE_CHAR_IDENTITY_TAIL);
   }
 
   // ⑥ 全剧统一风格尾巴
@@ -281,12 +312,12 @@ export function buildShotVideoPrompt(
   return parts.filter((p) => p && p.trim()).join(', ');
 }
 
-/** 运镜中文 → 英文(供测试/调试单独取用) */
+/** 运镜中文 → 英文(供测试/调试单独取用;实现走 camera-motion 单一词表) */
 export function cameraMotionEn(motion: string): string {
-  return CAMERA_MOTION_EN[String(motion || '').trim()] || '';
+  return cameraMotionEnShared(motion);
 }
 
-/** 景别中文 → 英文 */
+/** 景别中文 → 英文(实现走 camera-motion 单一词表) */
 export function shotTypeEn(shotType: string): string {
-  return SHOT_TYPE_EN[String(shotType || '').trim()] || '';
+  return shotTypeEnShared(shotType);
 }
